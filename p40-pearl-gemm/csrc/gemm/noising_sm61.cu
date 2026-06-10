@@ -1,10 +1,42 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-#define NOISE_TILE_M 64
-#define NOISE_TILE_K 64
-#define NOISE_R 64
+// Pascal (sm_61) noising kernels for the Pearl PoW pipeline.
+//
+// The miner adds structured low-rank noise to the (7-bit quantized) activation
+// matrix A and weight matrix B, then computes the noised GEMM ApEA @ BpEB^T.
+// Two int32 correction terms (AxEBL, EARxBpEB) are produced so the noise can be
+// removed afterwards (the denoise step). The noise factors are produced by the
+// BLAKE3 noise-generation kernel:
+//   EAL  [M,R]  dense int8, values in [-32, 32)
+//   EBR  [N,R]  dense int8, values in [-32, 32)
+//   EAR, EBL    sparse int8 (exactly one +1 and one -1 per K position), provided
+//               in both R-major [K,R] and K-major [R,K] layouts.
+//
+// noise_A consumes EAR_R_major [K,R] and EBL_K_major [R,K]:
+//   ApEA[m,k]  = A[m,k] + sum_r EAL[m,r] * EAR_Rmaj[k,r]   (int8; fits because
+//                A in [-63,63] and the noise term is in (-64,64))
+//   AxEBL[m,r] = sum_k A[m,k] * EBL_Kmaj[r,k]              (int32, uses clean A)
+//
+// noise_B consumes EBL_R_major [K,R] and EAR_K_major [R,K]:
+//   BpEB[n,k]     = B[n,k] + sum_r EBR[n,r] * EBL_Rmaj[k,r]      (int8)
+//   EARxBpEB[n,r] = sum_k BpEB[n,k] * EAR_Kmaj[r,k]              (int32, noised B)
+//
+// One block processes one row (m or n). The row of A/B and its dense noise row
+// are staged in dynamic shared memory; correctness is the priority over peak
+// throughput here.
 
+namespace {
+
+inline __device__ int8_t clamp_to_int8(int v) {
+  if (v > 127) v = 127;
+  if (v < -128) v = -128;
+  return (int8_t)v;
+}
+
+}  // namespace
+
+// EAR is EAR_R_major [K, R]; EBL is EBL_K_major [R, K].
 __global__ void noise_A_kernel(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ EAL,
@@ -14,110 +46,35 @@ __global__ void noise_A_kernel(
     int32_t* __restrict__ AxEBL,
     int M, int K, int R) {
 
-  int bx = blockIdx.x;
-  int m_start = bx * NOISE_TILE_M;
+  const int m = blockIdx.x;
+  if (m >= M) return;
 
-  __shared__ int8_t smem_A[NOISE_TILE_M * NOISE_TILE_K];
-  __shared__ int8_t smem_EAL[NOISE_TILE_M * NOISE_R];
-  __shared__ int8_t smem_EBL[NOISE_R * NOISE_TILE_K];
-  __shared__ int8_t smem_EAR[NOISE_TILE_K * NOISE_R];
+  extern __shared__ int8_t smem[];
+  int8_t* sA = smem;        // K bytes: A[m, :]
+  int8_t* sEAL = smem + K;  // R bytes: EAL[m, :]
 
-  int tid = threadIdx.x;
-  int total_threads = blockDim.x;
-
-  for (int i = tid; i < NOISE_TILE_M * NOISE_TILE_K; i += total_threads) {
-    int mi = i / NOISE_TILE_K;
-    int ki = i % NOISE_TILE_K;
-    int gm = m_start + mi;
-    if (gm < M && ki < K) {
-      smem_A[mi * NOISE_TILE_K + ki] = A[gm * K + ki];
-    }
-  }
-
-  for (int i = tid; i < NOISE_TILE_M * NOISE_R; i += total_threads) {
-    int mi = i / NOISE_R;
-    int ri = i % NOISE_R;
-    int gm = m_start + mi;
-    if (gm < M && ri < R) {
-      smem_EAL[mi * NOISE_R + ri] = EAL[gm * R + ri];
-    }
-  }
-
-  for (int i = tid; i < NOISE_R * NOISE_TILE_K; i += total_threads) {
-    int ri = i / NOISE_TILE_K;
-    int ki = i % NOISE_TILE_K;
-    if (ri < R && ki < K) {
-      smem_EBL[ri * NOISE_TILE_K + ki] = EBL[ri * K + ki];
-    }
-  }
-
-  for (int i = tid; i < NOISE_TILE_K * NOISE_R; i += total_threads) {
-    int ki = i / NOISE_R;
-    int ri = i % NOISE_R;
-    if (ki < K && ri < R) {
-      smem_EAR[ki * NOISE_R + ri] = EAR[ki * R + ri];
-    }
-  }
-
+  for (int k = threadIdx.x; k < K; k += blockDim.x) sA[k] = A[m * K + k];
+  for (int r = threadIdx.x; r < R; r += blockDim.x) sEAL[r] = EAL[m * R + r];
   __syncthreads();
 
-  int warp_id = tid / 32;
-  int lane = tid % 32;
-  int warps_m = NOISE_TILE_M / 16;
-  int warp_m = warp_id % warps_m;
-  int warp_n = warp_id / warps_m;  // n in output R dimension
-
-  int row_start = warp_m * 16;
-  int row_end = min(row_start + 16, NOISE_TILE_M);
-
-  if (warp_n >= 2) return;
-
-  for (int r_idx = warp_n * (NOISE_R / 2) + lane / 2;
-       r_idx < NOISE_R;
-       r_idx += (NOISE_R / 2) * 16) {
-    int sum = 0;
-    for (int kk = 0; kk < NOISE_TILE_K; kk += 4) {
-      int k_idx = kk + (lane % 4);
-      if (k_idx >= NOISE_TILE_K) break;
-      for (int mi = row_start; mi < row_end; ++mi) {
-        int a = smem_A[mi * NOISE_TILE_K + k_idx];
-        int ebl = smem_EBL[r_idx * NOISE_TILE_K + k_idx];
-        sum += a * ebl;
-      }
-    }
-
-    if ((lane % 2) == 0) {
-      for (int mi = row_start; mi < min(row_start + 16, (int)NOISE_TILE_M);
-           ++mi) {
-        if ((m_start + mi) < M) {
-          int eal_val = smem_EAL[mi * NOISE_R + r_idx];
-          int global_r = r_idx;
-          if (global_r < R) {
-            AxEBL[(m_start + mi) * R + global_r] = sum + eal_val * 0;
-          }
-        }
-      }
-    }
+  // ApEA[m,k] = A[m,k] + sum_r EAL[m,r] * EAR_Rmaj[k,r]
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    int acc = 0;
+    const int8_t* ear_row = &EAR[k * R];  // EAR_R_major: row k, R cols
+    for (int r = 0; r < R; ++r) acc += (int)sEAL[r] * (int)ear_row[r];
+    ApEA[m * K + k] = clamp_to_int8((int)sA[k] + acc);
   }
 
-  __syncthreads();
-
-  for (int i = tid; i < NOISE_TILE_M * NOISE_TILE_K; i += total_threads) {
-    int mi = i / NOISE_TILE_K;
-    int ki = i % NOISE_TILE_K;
-    int gm = m_start + mi;
-    int gk = ki;
-    if (gm < M && gk < K) {
-      int ea_sum = 0;
-      for (int r = 0; r < NOISE_R; ++r) {
-        ea_sum += smem_EAL[mi * NOISE_R + r] * smem_EAR[ki * NOISE_R + r];
-      }
-      int8_t result = smem_A[mi * NOISE_TILE_K + ki] + (int8_t)(ea_sum >> 8);
-      ApEA[gm * K + gk] = result;
-    }
+  // AxEBL[m,r] = sum_k A[m,k] * EBL_Kmaj[r,k]   (clean A)
+  for (int r = threadIdx.x; r < R; r += blockDim.x) {
+    int acc = 0;
+    const int8_t* ebl_row = &EBL[r * K];  // EBL_K_major: row r, K cols
+    for (int k = 0; k < K; ++k) acc += (int)sA[k] * (int)ebl_row[k];
+    AxEBL[m * R + r] = acc;
   }
 }
 
+// EBL is EBL_R_major [K, R]; EAR is EAR_K_major [R, K].
 __global__ void noise_B_kernel(
     const int8_t* __restrict__ B,
     const int8_t* __restrict__ EBR,
@@ -126,7 +83,43 @@ __global__ void noise_B_kernel(
     int8_t* __restrict__ BpEB,
     int32_t* __restrict__ EARxBpEB,
     int N, int K, int R) {
-  return;
+
+  const int n = blockIdx.x;
+  if (n >= N) return;
+
+  extern __shared__ int8_t smem[];
+  int8_t* sBpEB = smem;       // K bytes: B[n, :], overwritten with BpEB[n, :]
+  int8_t* sEBR = smem + K;    // R bytes: EBR[n, :]
+
+  for (int k = threadIdx.x; k < K; k += blockDim.x) sBpEB[k] = B[n * K + k];
+  for (int r = threadIdx.x; r < R; r += blockDim.x) sEBR[r] = EBR[n * R + r];
+  __syncthreads();
+
+  // BpEB[n,k] = B[n,k] + sum_r EBR[n,r] * EBL_Rmaj[k,r]
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    int acc = 0;
+    const int8_t* ebl_row = &EBL[k * R];  // EBL_R_major: row k, R cols
+    for (int r = 0; r < R; ++r) acc += (int)sEBR[r] * (int)ebl_row[r];
+    int8_t v = clamp_to_int8((int)sBpEB[k] + acc);
+    sBpEB[k] = v;              // reuse shared row as BpEB for the next stage
+    BpEB[n * K + k] = v;
+  }
+  __syncthreads();
+
+  // EARxBpEB[n,r] = sum_k BpEB[n,k] * EAR_Kmaj[r,k]   (noised B)
+  for (int r = threadIdx.x; r < R; r += blockDim.x) {
+    int acc = 0;
+    const int8_t* ear_row = &EAR[r * K];  // EAR_K_major: row r, K cols
+    for (int k = 0; k < K; ++k) acc += (int)sBpEB[k] * (int)ear_row[k];
+    EARxBpEB[n * R + r] = acc;
+  }
+}
+
+static int noise_block_threads(int K, int R) {
+  int want = K > R ? K : R;
+  int t = 256;
+  while (t < want && t < 1024) t <<= 1;
+  return t;
 }
 
 void launch_noise_A(
@@ -136,9 +129,10 @@ void launch_noise_A(
     int M, int K, int R,
     cudaStream_t stream) {
 
-  dim3 block(256);
-  dim3 grid((M + NOISE_TILE_M - 1) / NOISE_TILE_M);
-  noise_A_kernel<<<grid, block, 0, stream>>>(
+  dim3 block(noise_block_threads(K, R));
+  dim3 grid(M);
+  size_t smem = (size_t)(K + R) * sizeof(int8_t);
+  noise_A_kernel<<<grid, block, smem, stream>>>(
       A, EAL, EAR, EBL, ApEA, AxEBL, M, K, R);
 }
 
@@ -149,8 +143,9 @@ void launch_noise_B(
     int N, int K, int R,
     cudaStream_t stream) {
 
-  dim3 block(256);
-  dim3 grid((N + NOISE_TILE_M - 1) / NOISE_TILE_M);
-  noise_B_kernel<<<grid, block, 0, stream>>>(
+  dim3 block(noise_block_threads(K, R));
+  dim3 grid(N);
+  size_t smem = (size_t)(K + R) * sizeof(int8_t);
+  noise_B_kernel<<<grid, block, smem, stream>>>(
       B, EBR, EAR, EBL, BpEB, EARxBpEB, N, K, R);
 }

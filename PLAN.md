@@ -1,0 +1,278 @@
+# P40-Pearl-GEMM — Architecture & Plan
+
+## Goal
+
+Fork [AlphaMine-Tech/alpha-miner](https://github.com/AlphaMine-Tech/alpha-miner) to enable Pearl (PRL) proof-of-work mining on **NVIDIA Tesla P40 (sm_61)** using:
+
+- **INT8 DP4A** (via `dp4a.s32.s32` PTX) for the GEMM hot loop
+- **FP32** CUDA cores for noise generation and auxiliary kernels
+- No Tensor Core dependency (P40 has no Tensor Cores)
+
+## Hardware
+
+| Device | Architecture | Key Feature |
+|--------|-------------|-------------|
+| Tesla P40 | sm_61 (Pascal) | DP4A INT8 intrinsic, no Tensor Cores |
+| GTX 1070 | sm_61 (Pascal) | Same feature set for dev/test |
+
+## Software Stack
+
+- **CUDA 12.8** toolkit at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`
+- **PyTorch 2.6.0+cu124** (CUDA 12.4 runtime)
+- **Python 3.13.12** (conda env `pytorch`)
+- **MSVC 2022** (cl.exe)
+- **CUTLASS** headers at `aphrodite-engine\.deps\cutlass-src\include\`
+- **Windows x64**
+
+## Repository Structure
+
+```
+p40-alpha-miner/
+├── p40-pearl-gemm/                    # Buildable package
+│   ├── setup.py                       # Build config (sm_61 primary target)
+│   ├── pyproject.toml
+│   ├── tests/
+│   │   └── test_build.py              # Smoke tests
+│   ├── python/
+│   │   ├── __init__.py                # Re-exports from bindings
+│   │   └── p40_gemm_bindings.py       # PyTorch -> C API bindings
+│   └── csrc/
+│       ├── blake3/                     # Upstream BLAKE3 (no mods needed)
+│       ├── tensor_hash/                # Upstream Merkle tree (no mods needed)
+│       └── gemm/
+│           ├── dp4a_gemm_sm61.cu       # ★ NEW: Pascal INT8 GEMM via dp4a.s32.s32
+│           ├── noising_sm61.cu         # ★ NEW: Pascal noise A/B kernels
+│           ├── api_sm61.cu             # ★ NEW: C API + inline denoise converter
+│           ├── convert_util.h          # Upstream FlashAttention-derived converter
+│           ├── denoise_converter.cu    # Upstream template instantiation
+│           ├── denoise_converter_host.h # Upstream launch wrapper (patched: no cluster_launch)
+│           ├── denoise_converter_kernel.h # Upstream CuTe kernel (uses CUTLASS types)
+│           ├── error_check.hpp         # Upstream CUDA error checking
+│           ├── host_signal_header.hpp   # Upstream host signal structs
+│           ├── inner_hash_kernel.cu    # Upstream inner hash kernel (uses CuTe)
+│           ├── inner_hash_kernel.h     # Upstream inner hash host header
+│           ├── noise_generation.cu     # Upstream template instantiation
+│           ├── noise_generation_host.h # Upstream launch wrapper (patched: no cluster_launch)
+│           ├── noise_generation_kernel.h # Upstream CuTe noise gen kernel
+│           ├── pearl_api_params.h      # Upstream param structs
+│           ├── pearl_gemm_constants.hpp # Upstream scaling constants
+│           ├── pow_utils.hpp           # Upstream PoW helpers (uses CuTe)
+│           ├── quantization_util.cuh   # Upstream quant util from vLLM
+│           ├── quantize_kernel.cu      # Upstream quant kernel
+│           ├── quantize_kernel.hpp     # Upstream quant kernel header
+│           └── utils.h                 # Upstream CuTe/CUTLASS utilities
+└── PLAN.md                            # This file
+```
+
+## Legend
+
+| Marker | Meaning |
+|--------|---------|
+| ★ NEW  | Written from scratch for Pascal P40 (no upstream equivalent) |
+| ★ PATCHED | Upstream file with minimal modifications to remove SM90 dependency |
+| (no marker) | Copied verbatim from upstream alpha-miner |
+
+## Kernel Inventory
+
+### Pascal-Specific (pure CUDA, no CUTLASS)
+
+| Kernel | File | Description |
+|--------|------|-------------|
+| `dp4a_gemm_kernel` | `dp4a_gemm_sm61.cu` | INT8 GEMM via `dp4a.s32.s32`, 64×64 tiles, 4 warps, shared memory tiling, dequant to fp16 |
+| `noise_A_kernel` | `noising_sm61.cu` | INT8 noise A: loads A/EAL/EBL/EAR → shared mem → computes ApEA + AxEBL |
+| `noise_B_kernel` | `noising_sm61.cu` | INT8 noise B: same structure for B (stub implementation) |
+| `launch_denoise_converter` | `api_sm61.cu` | Simple int32→fp16 conversion inline (no CuTe/CUTLASS) |
+
+### Upstream (use CuTe/CUTLASS via included headers)
+
+| Kernel | File | Description |
+|--------|------|-------------|
+| `NoiseGenerationKernel<R,N>` | `noise_generation_kernel.h` | BLAKE3-based random noise matrix generation |
+| `DenoiseConverterKernel<R,N>` | `denoise_converter_kernel.h` | CuTe tiled int32→fp16+scale conversion |
+| `inner_hash_kernel<NUM_ITER>` | `inner_hash_kernel.cu` | XOR-reduction inner hash with CuTe tensors |
+| quantize kernel | `quantize_kernel.cu` | Dynamic per-token int8 quantization from vLLM |
+
+### Architecture-Independent Headers
+
+| File | Source |
+|------|--------|
+| `blake3/` | Upstream (standalone CUDA BLAKE3) |
+| `tensor_hash/` | Upstream (CuTe-based Merkle tree) |
+
+## Build Configuration
+
+**Target architecture**: `sm_61` (Pascal P40/GTX 1070) by default
+
+**Additional archs** (via `ADDITIONAL_ARCHS` env): `sm_70,sm_75,sm_80,sm_86`
+
+**CUTLASS include path**: `aphrodite-engine\.deps\cutlass-src\include` (hardcoded absolute)
+
+**Key nvcc flags**:
+- `-std=c++17`, `--expt-relaxed-constexpr`, `--expt-extended-lambda`
+- `--use_fast_math`, `-lineinfo`
+- Half enablement: `-U__CUDA_NO_HALF_OPERATORS__` etc.
+
+**Build command**: `python setup.py build_ext --inplace`
+
+## Patches Applied
+
+### 1. `setup.py` — CUTLASS include path
+Add CUTLASS headers for CuTe/CUTLASS template resolution. Now configurable via
+the `CUTLASS_DIR` env var (falls back to the local aphrodite-engine checkout).
+Also adds `csrc/gemm/bindings.cpp` to the source list (and drops the SM90-only
+`csrc/tensor_hash/tensor_hash.cu`; see "Remaining work").
+
+### 2. `noise_generation_host.h` — Remove SM90 cluster_launch
+Remove `#include "cutlass/cluster_launch.hpp"`. Keep `cutlass/device_kernel.h` which provides `cutlass::device_kernel<Op>` — a simple `__global__` wrapper compatible with sm_61.
+
+### 3. `denoise_converter_host.h` — Remove SM90 cluster_launch
+Same patch: replace `cluster_launch.hpp` with `device_kernel.h`.
+
+### 4. `pow_utils.hpp` — Remove SM90 MMA trait include
+Remove `#include <cute/atom/mma_traits_sm90_gmma.hpp>`. The `xor_reduction` function only needs `cute/array.hpp` and `cute/fold.hpp` which come transitively via `cute/tensor.hpp` (included from `utils.h`).
+
+### 5. `bindings.cpp` — NEW pybind11 module (was entirely missing)
+The Python layer (`p40_gemm_bindings.py`) called `_C.dp4a_gemm(...)` etc., but
+**no `PYBIND11_MODULE` existed anywhere** — the built extension exported zero
+callable functions. Added `csrc/gemm/bindings.cpp` registering `dp4a_gemm`,
+`noise_A`, `noise_B`, `denoise_converter`, and `inner_hash` as torch-tensor
+wrappers. Built as a **host `.cpp`** (MSVC/gcc), not nvcc: the torch headers do
+not parse under nvcc + C++20 (the upstream CuTe code requires C++20). Each
+wrapper installs a `c10::cuda::CUDAGuard` so launches target the tensors'
+device (a multi-GPU box otherwise dereferences another device's pointers).
+
+### 6. `dp4a_gemm_sm61.cu` — Rewrote the GEMM thread→tile mapping
+The original kernel's `a_row = lane/16 + warp_x*16` only ever produced output
+rows {0,1,16,17}, so it wrote 4 of every 64 rows and left the rest garbage.
+Replaced with a 16×16-thread / 4×4-micro-tile scheme that covers the full
+64×64 output tile. **Validated on Tesla P40 and GTX 1070** (max relative error
+0.0005 vs. an int reference). See `tests/test_gemm_native.cu` and
+`tests/test_module_e2e.py`.
+
+### 7. `noising_sm61.cu` — Rewrote noise_A and implemented noise_B
+The original `noise_A` was incorrect (partial K-reduction, cross-lane races,
+no-op `+ eal_val*0`) and `noise_B` was an empty stub. Both rewritten to the
+exact algebra recovered from `noise_generation_kernel.h`:
+`ApEA = A + EAL·EAR`, `AxEBL = A·EBLᵀ` (clean A); `BpEB = B + EBR·EBL`,
+`EARxBpEB = BpEB·EARᵀ` (noised B). Inputs are 7-bit quantized so the noised
+int8 matrices fit without any bit-shift. **Validated bit-exact vs. a CPU
+reference on P40/GTX 1070** (`tests/test_noise_native.cu`, `test_module_e2e.py`).
+
+### 8. `api_sm61.cu` — Fixed denoise converter (did not compile)
+`launch_denoise_converter` was a `__host__` function that referenced
+`blockIdx`/`threadIdx`/`gridDim` and invoked a `__device__` lambda from host —
+it could never compile. Rewrote as a proper `__global__` kernel + host
+launcher, using the correct **separate** scale factors confirmed against
+`DenoiseConverterKernel`: AxEBL ÷ `kAxEBLScaleFactor` (1<<14), EARxBpEB ÷
+`kEARxBpEBScaleFactor` (1<<12).
+
+### 9. Build flags & portability (`setup.py`, headers)
+- `-std=c++20` for nvcc (upstream uses designated initializers in `blake3.cuh`
+  and `requires` clauses in `utils.h`).
+- Host (`cxx`) flags made MSVC-compatible on Windows (`/O2`).
+- `CUTLASS_DIR` env var for the CUTLASS include path.
+- `merkle_tree_utils.hpp`: replaced host-only `ceil(log2(num_leaves))` with a
+  device `__clz`-based `ceil_log2_u32` (the `<cmath>` integral `log2` overload
+  is not callable from device code).
+- `quantize_kernel.cu` / `.hpp`: removed unused `<torch/all.h>` / `<ATen/ATen.h>`
+  (they don't parse under nvcc + C++20) and replaced `cuda::maximum<>` (shadowed
+  by torch's bundled CCCL) with a local `fmaxf` functor.
+
+## Build & validation status (CUDA 12.8, MSVC 2022, torch 2.6.0+cu124, sm_61)
+
+`python setup.py build_ext --inplace` **succeeds** and produces
+`p40_pearl_gemm_cuda*.pyd`. `tests/test_module_e2e.py` passes on **both** the
+Tesla P40 and the GTX 1070 for every registered op:
+
+| Op | Status |
+|----|--------|
+| `dp4a_gemm` | ✅ build + numerically validated (rel err 5e-4) |
+| `noise_A` / `noise_B` | ✅ build + bit-exact vs CPU reference |
+| `denoise_converter` | ✅ build + bit-exact (1<<14 / 1<<12) |
+| `inner_hash` | ✅ build + runs (CuTe kernel works on sm_61) |
+| `pearl_pow` | ✅ **Pascal PoW core — bit-exact vs the reference transcript + keyed-BLAKE3** on the P40 (see below) |
+| `tensor_hash` | ✅ **Pascal rewrite, bit-exact vs stock BLAKE3 keyed hash** on the P40 for all realistic configs (see below) |
+| `noise_generation.cu`, `denoise_converter.cu` | ✅ compile on sm_61 (not yet wired into bindings) |
+| `quantize_kernel.cu` | ✅ compiles (not yet registered; quantization is also trivially doable in torch) |
+
+### `tensor_hash` Pascal rewrite (DONE)
+The SM90 `merkle_tree_roots_kernel` (TMA + warpgroup pipelines) was replaced by
+`merkle_tree_roots_kernel_sm61.hpp` — one thread per 1024-byte chunk, BLAKE3
+keyed leaf via direct global loads, then the stock per-CTA Merkle reduction. The
+downstream `ComputeBlakeMTKernel`/`ReduceRootsKernel` and the commitment-hash
+kernel are plain CuTe and reused unchanged via `tensor_hash_host_sm61.hpp`.
+`tests/test_tensor_hash.py` confirms the output equals
+`blake3.blake3(data, key=key).digest()` for every config with `num_roots ≥ 2`
+(`num_roots = ceil(num_chunks / threads_per_block)`), which is **every config
+the miner actually uses** — `run_tensor_hash` requires data > 2¹⁷ bytes and the
+default `threads_per_block = 128`. The degenerate `num_roots == 1` case skips
+BLAKE3's ROOT finalization (matching the upstream pipeline's structure) and is
+never hit in production.
+
+## Reference source (the earlier "hard ceiling" is lifted)
+
+The canonical Pearl source is public at **github.com/pearl-research-labs/pearl**
+(cloned to `C:\Users\ADMIN\audits\pearl-ref`). It contains the full GPU source
+(`miner/pearl-gemm`, incl. the fused `pearl_gemm_kernel.h` + collective
+mainloop/epilogue that were missing here) **and** readable Python reference
+implementations in `miner/miner-base/src/miner_base/` (`noisy_gemm.py`,
+`noise_generation.py`, `inner_hash.py`, `matrix_merkle_tree.py`) plus a
+validation oracle (`miner/vllm-miner/tests/test_reference_vs_kernels.py`).
+
+The PoW, recovered from `noisy_gemm.py`: tile m,n,k by `R = noise_rank` (128);
+per 16×16 hash tile, for each full k-tile `t`, XOR-reduce the **cumulative**
+int32 partial sum and `transcript[t%16] = rotl32(transcript[t%16],13) ^ h`; the
+tile wins if `blake3(transcript_LE, key=noise_seed_A) ≤ target`. The denoised
+result (`C − A·E_BL·E_BR − E_AL·E_AR·B_noised`) is the *inference* output and is
+**not** part of the PoW hash.
+
+### `pearl_pow` Pascal PoW (DONE, validated)
+`pearl_pow_sm61.cu` computes the PoW with one CUDA block per 16×16 tile, DP4A for
+the int8 contraction, and the validated `blake3.cuh` for the keyed compression.
+`tests/test_pearl_pow.py` confirms the per-tile digests are **bit-exact** vs a
+faithful CPU reimplementation of `noisy_gemm.py` (shapes 128–512, R=64/128) and
+the ≤target found-flag behaves correctly. The noising kernels (`noise_A/noise_B`)
+are algebraically consistent with `noisy_gemm.py`'s `noise_A/noise_B`.
+
+## Work model (recovered from pearl-gateway / miner-base)
+
+A `MiningJob` is just `(incomplete_header_bytes, target)`. **The miner chooses
+A and B** — Pearl is proof-of-*useful*-work, but consensus only requires validly
+committed operands, not a specific model. Per attempt:
+`key = blake3(incomplete_header_bytes + MiningConfiguration.to_bytes())`; the
+matrices are committed via keyed-BLAKE3 Merkle roots of `A` and `Bᵀ`
+(`MatrixMerkleTree`, which equals flat keyed BLAKE3 of the bytes), then
+`commitment_B = blake3(key+root_B)`, `commitment_A = blake3(commitment_B+root_A)`;
+`(noise_seed_A, noise_seed_B) = (commitment_A, commitment_B)`. Noise is generated
+from the seeds; `pow_key = noise_seed_A`. A win is submitted as `OpenedBlockInfo`
+→ `PlainProof` (Merkle proofs of the winning tile's A rows / B cols) → the gateway
+wraps it in a zk-pow proof and submits to the node.
+
+### End-to-end Pascal pipeline (DONE, validated — `python/pearl_miner.py`)
+`mine_once(header, target, A, B)` chains: derive key → commit (CUDA `tensor_hash`
+Merkle roots + BLAKE3) → generate noise → noised operands → `pearl_pow`.
+`tests/test_pipeline_e2e.py` runs it on the P40: finds blocks at an easy target,
+**independently re-verifies the winning tile's transcript ≤ target**, and finds
+nothing at the hardest target. The cheap steps (noise gen, noised operands) are
+faithful torch/BLAKE3 ports of `noise_generation.py` / `noisy_gemm.py`; the hot
+path is the validated `pearl_pow` CUDA kernel.
+
+## Remaining work for live mining
+
+1. **Gateway/pool plumbing (task #8).** Implement `MiningConfiguration.to_bytes()`
+   (or build the Rust `py-pearl-mining`) so the key/commitments match the network;
+   fetch jobs and submit `OpenedBlockInfo`→`PlainProof` via `miner-base`'s gateway
+   client (JSON-RPC) or a pool stratum bridge. Needs a live gateway/node to test.
+2. **Perf:** move noise gen / noised-operand matmuls from torch onto the existing
+   CUDA kernels (`noise_gen`, `noise_A`, `noise_B`) and fuse; tune `pearl_pow`.
+3. **Optional Pascal denoise-subtract** for the actual inference output (only the
+   "useful work" result, not the PoW share).
+4. **Host (option B): llama.cpp** — route a model's linear-layer GEMMs through the
+   noised pipeline for genuine useful-work mining (better Pascal inference than
+   vLLM/aphrodite; the README anticipates non-vLLM plugins).
+
+## Residual notes
+- The build still targets sm_61 plus sm_70/75/80/86 (from torch's default arch
+  list); set `TORCH_CUDA_ARCH_LIST=6.1` to build P40-only and cut build time.
+- `pow_utils.hpp` still contains unused SM90 template code (`TileHashAccumulator`)
+  that parses but is never instantiated on the Pascal path.

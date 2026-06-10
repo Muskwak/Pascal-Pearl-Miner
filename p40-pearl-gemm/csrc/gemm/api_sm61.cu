@@ -2,29 +2,52 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
-extern "C" {
+#include "pearl_gemm_constants.hpp"
 
-void launch_dp4a_gemm(
-    const int8_t* A, const int8_t* B,
-    const float* A_scales, const float* B_scales,
-    half* C, int M, int N, int K,
-    cudaStream_t stream);
+// Pascal (sm_61) denoise converter: int32 -> fp16 with a fixed power-of-two
+// rescale.  Replaces the upstream CuTe/CUTLASS DenoiseConverterKernel for the
+// Pascal path.  The two operands (EARxBpEB of size N*R and AxEBL of size M*R)
+// are converted in a single fused launch; either may be disabled by passing a
+// null pointer pair, in which case its element count is zero.
 
-void launch_noise_A(
-    const int8_t* A, const int8_t* EAL,
-    const int8_t* EAR, const int8_t* EBL,
-    int8_t* ApEA, int32_t* AxEBL,
-    int M, int K, int R,
-    cudaStream_t stream);
+namespace {
 
-void launch_noise_B(
-    const int8_t* B, const int8_t* EBR,
-    const int8_t* EAR, const int8_t* EBL,
-    int8_t* BpEB, int32_t* EARxBpEB,
-    int N, int K, int R,
-    cudaStream_t stream);
+__global__ void denoise_convert_kernel(
+    const int32_t* __restrict__ EARxBpEB_in,
+    const int32_t* __restrict__ AxEBL_in,
+    half* __restrict__ EARxBpEB_out,
+    half* __restrict__ AxEBL_out,
+    int n_earxbpeb,
+    int n_axebl) {
 
-void launch_denoise_converter(
+  // The two operands use different fixed-point scales (see DenoiseConverterKernel
+  // / pearl_gemm_constants.hpp): AxEBL is divided by 1<<14, EARxBpEB by 1<<12.
+  constexpr float kInvScaleEARxBpEB =
+      1.0f / float(pearl::kEARxBpEBScaleFactor);  // 1 / (1<<12)
+  constexpr float kInvScaleAxEBL =
+      1.0f / float(pearl::kAxEBLScaleFactor);      // 1 / (1<<14)
+
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = gridDim.x * blockDim.x;
+  const int total = n_earxbpeb + n_axebl;
+
+  for (int i = idx; i < total; i += stride) {
+    if (i < n_earxbpeb) {
+      float fval = float(EARxBpEB_in[i]) * kInvScaleEARxBpEB;
+      fval = fmaxf(-65504.0f, fminf(65504.0f, fval));
+      EARxBpEB_out[i] = __float2half(fval);
+    } else {
+      int j = i - n_earxbpeb;
+      float fval = float(AxEBL_in[j]) * kInvScaleAxEBL;
+      fval = fmaxf(-65504.0f, fminf(65504.0f, fval));
+      AxEBL_out[j] = __float2half(fval);
+    }
+  }
+}
+
+}  // namespace
+
+extern "C" void launch_denoise_converter(
     const int32_t* EARxBpEB_in,
     const int32_t* AxEBL_in,
     half* EARxBpEB_out,
@@ -32,45 +55,14 @@ void launch_denoise_converter(
     int M, int N, int R,
     cudaStream_t stream) {
 
-  int total = 0;
-  if (EARxBpEB_in && EARxBpEB_out) {
-    total += N * R;
-  }
-  if (AxEBL_in && AxEBL_out) {
-    total += M * R;
-  }
-
+  int n_earxbpeb = (EARxBpEB_in && EARxBpEB_out) ? N * R : 0;
+  int n_axebl = (AxEBL_in && AxEBL_out) ? M * R : 0;
+  int total = n_earxbpeb + n_axebl;
   if (total == 0) return;
 
   int threads = 256;
   int blocks = (total + threads - 1) / threads;
 
-  auto convert_kernel = [=] __device__ (int i) {
-    if (EARxBpEB_in && EARxBpEB_out) {
-      if (i < N * R) {
-        int val = EARxBpEB_in[i];
-        float fval = (float)val / 4096.0f;
-        fval = fmaxf(-65504.0f, fminf(65504.0f, fval));
-        EARxBpEB_out[i] = __float2half(fval);
-      }
-      i -= N * R;
-    }
-    if (AxEBL_in && AxEBL_out) {
-      if (i < M * R) {
-        int val = AxEBL_in[i];
-        float fval = (float)val / 4096.0f;
-        fval = fmaxf(-65504.0f, fminf(65504.0f, fval));
-        AxEBL_out[i] = __float2half(fval);
-      }
-    }
-  };
-
-  // Simple grid-stride loop kernel
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int stride = gridDim.x * blockDim.x;
-  for (int i = idx; i < total; i += stride) {
-    convert_kernel(i);
-  }
+  denoise_convert_kernel<<<blocks, threads, 0, stream>>>(
+      EARxBpEB_in, AxEBL_in, EARxBpEB_out, AxEBL_out, n_earxbpeb, n_axebl);
 }
-
-}  // extern "C"

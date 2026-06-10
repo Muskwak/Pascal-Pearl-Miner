@@ -1,0 +1,17 @@
+# Build artifacts
+p40-pearl-gemm/build/
+p40-pearl-gemm/*.pyd
+p40-pearl-gemm/*.so
+p40-pearl-gemm/*.dll
+p40-pearl-gemm/*.exe
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user

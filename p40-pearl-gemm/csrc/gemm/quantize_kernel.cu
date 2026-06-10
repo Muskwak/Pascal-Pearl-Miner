@@ -1,10 +1,11 @@
 // Based on vLLM:
 //  * https://github.com/vllm-project/vllm/blob/main/csrc/quantization/w8a8/int8/scaled_quant.c
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+// NOTE: torch/ATen headers (<torch/all.h>, <ATen/cuda/CUDAContext.h>,
+// <c10/cuda/CUDAGuard.h>) were removed: this translation unit uses no torch
+// symbols, and those headers do not parse under nvcc + C++20 (which the
+// upstream CuTe code requires).
 #include <cuda_runtime.h>
 #include <cutlass/numeric_types.h>
-#include <torch/all.h>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include "quantization_util.cuh"
@@ -16,6 +17,16 @@ using pearl::vectorize_with_alignment;
 using pearl::vectorize_with_aux_global;
 
 constexpr int COMPILE_TIME_STRIDE = 256;
+
+// Local max functor. Avoids depending on cuda::maximum from <cuda/functional>,
+// whose definition can be shadowed by torch's bundled CCCL headers (the toolkit
+// version isn't always the one resolved), causing "namespace cuda has no member
+// maximum" at build time.
+struct MaxFloatOp {
+  __device__ __forceinline__ float operator()(float a, float b) const {
+    return fmaxf(a, b);
+  }
+};
 
 static CUTLASS_DEVICE int8_t float_to_int8_rn(float x) {
 #ifdef USE_ROCM
@@ -93,7 +104,7 @@ CUTLASS_GLOBAL void dynamic_scaled_quant_kernel(
   using BlockReduce = cub::BlockReduce<float, COMPILE_TIME_STRIDE>;
   __shared__ typename BlockReduce::TempStorage tmp;
   float block_max =
-      BlockReduce(tmp).Reduce(thread_max, ::cuda::maximum<>{}, blockDim.x);
+      BlockReduce(tmp).Reduce(thread_max, MaxFloatOp{}, blockDim.x);
 
   __shared__ float scale;
   __shared__ bool is_zero;

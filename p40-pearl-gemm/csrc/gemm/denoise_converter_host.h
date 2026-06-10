@@ -6,7 +6,6 @@
 #include "pearl_api_params.h"
 
 #include <cutlass/kernel_hardware_info.h>
-#include "cutlass/cluster_launch.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/device_kernel.h"  // For device_kernel
 

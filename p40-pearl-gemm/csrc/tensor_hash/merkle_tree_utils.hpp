@@ -11,6 +11,15 @@ namespace merkle_tree_utils {
 
 using namespace cute;
 
+// Device-safe ceil(log2(n)). The bare `log2(num_leaves)` resolves to the
+// host-only integral overload from <cmath>, which cannot be called from device
+// code. num_leaves is a runtime value, so compute it with integer bit ops.
+CUTLASS_DEVICE int ceil_log2_u32(uint32_t n) {
+  if (n <= 1) return 0;
+  int floor_log2 = 31 - __clz(n);
+  return ((n & (n - 1)) == 0) ? floor_log2 : floor_log2 + 1;
+}
+
 using RmemLayoutChunk = Layout<Shape<Int<blake3::CHAINING_VALUE_SIZE_U32 * 2>>>;
 using RmemLayoutChainingValue =
     Layout<Shape<Int<blake3::CHAINING_VALUE_SIZE_U32>>>;
@@ -80,7 +89,7 @@ CUTLASS_DEVICE void compute_blake_mt(SmemTensorLeaves const& sLeaves,
   int virtual_tid = 0;
   int largest_subtree = 0;
   // Compute some of the offsets and indices
-  for (int i = static_cast<int>(ceil(log2(num_leaves))); i >= 0; --i) {
+  for (int i = ceil_log2_u32(num_leaves); i >= 0; --i) {
     const u32 bit_value = 1u << i;
     if (num_leaves & bit_value) {
       if (largest_subtree == 0) {
@@ -140,7 +149,7 @@ CUTLASS_DEVICE void compute_blake_mt(SmemTensorLeaves const& sLeaves,
     u32 read_offset = num_leaves;
     bool written_to_chunk = false;
     // Start by writing the rightmost root to the chunk; then, hash the current aggregated root with the next roots
-    for (int i = 0; i < static_cast<int>(ceil(log2(num_leaves))); ++i) {
+    for (int i = 0; i < ceil_log2_u32(num_leaves); ++i) {
       const u32 bit_mask = 1u << i;
       if (read_offset & bit_mask) {
         if (!written_to_chunk) {

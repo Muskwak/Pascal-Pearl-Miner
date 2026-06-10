@@ -63,7 +63,8 @@
 */
 #pragma once
 
-#include <ATen/ATen.h>
+// <ATen/ATen.h> removed: unused here and it does not parse under nvcc + C++20.
+#include <cstdint>
 #include <cuda_runtime.h>
 
 // Maximum quantization values for 7-bit and 8-bit quantization
