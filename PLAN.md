@@ -234,6 +234,60 @@ faithful CPU reimplementation of `noisy_gemm.py` (shapes 128–512, R=64/128) an
 the ≤target found-flag behaves correctly. The noising kernels (`noise_A/noise_B`)
 are algebraically consistent with `noisy_gemm.py`'s `noise_A/noise_B`.
 
+Option A's compute pipeline is delivered and validated on your P40.
+
+### What now works (validated on the Tesla P40)
+
+`python/pearl_miner.py` — a complete Pascal mining pipeline:
+
+`mine_once(header, target, A, B)`:
+  `key      = blake3(header + mining_config_bytes)`
+  `seeds    = commit(A, B, key)`        # CUDA tensor_hash Merkle roots + BLAKE3
+  `E_*      = generate_noise(seeds)`    # faithful port of noise_generation.py
+  `A_n,B_n  = noised_operands(...)`     # noisy_gemm.py noise_A/noise_B
+  `result   = pearl_pow(A_n, B_nᵀ, pow_key=seed_A, target)`   # validated CUDA kernel
+
+`tests/test_pipeline_e2e.py` passes: it finds a block at an easy target,
+independently recomputes the winning 16×16 tile's transcript and confirms
+`blake3(transcript, key=seed_A) ≤ target`, finds nothing at the hardest target,
+and `mine_once` agrees. The PoW core (`pearl_pow_sm61.cu`) is bit-exact vs the
+reference `noisy_gemm.py`.
+
+So the entire consensus computation — commit → noise → noised GEMM → per-tile
+keyed-BLAKE3 PoW — runs correctly on a P40. That's the part that was impossible
+before we had the reference.
+
+### What I learned about the work model (the key unlock)
+
+A job is only `(incomplete_header_bytes, target)` — the miner picks A and B
+itself and commits to them. Pearl is proof-of-*useful*-work, but consensus just
+needs validly-committed operands, so a standalone miner with synthetic (or
+real-inference) matrices is protocol-valid. `MatrixMerkleTree == flat keyed
+BLAKE3`, so the `tensor_hash` commitment is network-faithful for full-size
+matrices.
+
+### To finish A as a live miner (task #8)
+
+Two things remain, both plumbing rather than compute:
+
+1. `MiningConfiguration.to_bytes()` — the key derivation must byte-match the
+   Rust `pearl_mining` crate, or the pool rejects the commitment. Need to read
+   that Rust source (or build `py-pearl-mining`) and mirror it.
+2. **Gateway/pool connection + submission** — fetch jobs and submit
+   `OpenedBlockInfo → PlainProof` via `miner-base`'s JSON-RPC gateway client
+   (solo: needs a running `pearld` + `pearl-gateway`) or a pool stratum bridge.
+
+Both need a live Pearl node/gateway or pool access. Can write the loop + config
+serialization so it's ready, but can't validate share acceptance without a
+network endpoint.
+
+### Plan from here
+
+1. Mirror `MiningConfiguration.to_bytes()` from the Rust source and wire the
+   gateway client + submission so it's ready to point at a node/pool.
+2. Then B (llama.cpp): route a model's linear-layer GEMMs through this same
+   pipeline for real useful-work mining.
+
 ## Work model (recovered from pearl-gateway / miner-base)
 
 A `MiningJob` is just `(incomplete_header_bytes, target)`. **The miner chooses

@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 import pearl_miner as pm
+from mining_config import MiningConfiguration, PeriodicPattern, patterns_for_tile
 
 dev = torch.device("cuda", int(os.environ.get("GEMM_TEST_DEV", "0")))
 print(f"Device: {torch.cuda.get_device_name(dev)} (cc {torch.cuda.get_device_capability(dev)})")
@@ -61,8 +62,12 @@ m, n, k = 256, 256, 256
 A = torch.randint(-64, 64, (m, k), dtype=torch.int8, generator=g).to(dev)
 B = torch.randint(-64, 64, (k, n), dtype=torch.int8, generator=g).to(dev)
 
+# Build a MiningConfiguration matching the matmul dims
+rp, cp = patterns_for_tile(m, n)
+mining_config = MiningConfiguration(common_dim=k, rank=R, rows_pattern=rp, cols_pattern=cp)
+
 # Recompute the noised operands the way mine_once does, so we can verify a hit.
-key = pm.derive_key(header, m, n, k, R)
+key = pm.derive_key(header, mining_config)
 seed_A, seed_B = pm.commitment_hashes(A, B, key)
 E_AL, E_AR, E_BL, E_BR = pm.generate_noise(seed_A, seed_B, m, k, n, R)
 
@@ -90,7 +95,7 @@ res0 = pm.run_pow(A_noised, B_noised, seed_A, 0, R)
 check("no block at hardest target (0)", not res0.found)
 
 # Full mine_once convenience path runs and agrees on found-ness at easy target.
-res2 = pm.mine_once(header, easy, A, B, R)
+res2 = pm.mine_once(header, easy, A, B, mining_config=mining_config)
 check("mine_once finds at easy target", res2.found)
 
 # A realistic-ish target: scan a few nonces, expect to eventually find.
@@ -98,7 +103,7 @@ found_any = False
 for nonce in range(8):
     hdr = header[:-4] + struct.pack("<I", nonce)
     medium = (2**256 - 1) // (1 << 40)  # ~1 in 2^40 per tile; many tiles per matmul
-    r = pm.mine_once(hdr, medium, A, B, R)
+    r = pm.mine_once(hdr, medium, A, B, mining_config=mining_config)
     if r.found:
         found_any = True
         break

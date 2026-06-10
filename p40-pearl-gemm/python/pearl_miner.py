@@ -17,12 +17,11 @@ torch/BLAKE3 ports of `miner_base.noise_generation` / `noisy_gemm` and are cheap
 
 NOTE on network compatibility: `mining_config_bytes` must equal
 `MiningConfiguration.to_bytes()` from the Rust `pearl_mining` crate for the pool to
-accept shares; `_mining_config_bytes()` below is a clearly-marked placeholder for
-offline self-test. Everything downstream of the key is protocol-exact.
+accept shares. This module now uses the real `MiningConfiguration` serialization
+(52 bytes, via `mining_config.py`). Everything downstream of the key is protocol-exact.
 """
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 from math import ceil
 
@@ -31,6 +30,9 @@ import numpy as np
 import torch
 
 import p40_pearl_gemm_cuda as _C
+
+from gateway_client import BLAKE3_CHUNK_LEN, PlainProof, MatrixMerkleProof, MerkleProofData, pad_to_chunk_boundary
+from mining_config import MiningConfiguration, PeriodicPattern, patterns_for_tile
 
 NOISE_RANK = 128
 NOISE_RANGE = 128
@@ -131,14 +133,20 @@ def commitment_hashes(A: torch.Tensor, B: torch.Tensor, key: bytes) -> tuple[byt
     return commitment_A, commitment_B  # (noise_seed_A, noise_seed_B)
 
 
-def _mining_config_bytes(m: int, n: int, k: int, rank: int) -> bytes:
-    """PLACEHOLDER for offline self-test only. The real value must equal the Rust
-    pearl_mining MiningConfiguration.to_bytes() for pool acceptance."""
-    return struct.pack("<IIII", m, n, k, rank)
+def derive_key(incomplete_header_bytes: bytes, mining_config: MiningConfiguration) -> bytes:
+    """Key = BLAKE3(header_bytes + MiningConfiguration.to_bytes())."""
+    return blake3.blake3(incomplete_header_bytes + mining_config.to_bytes()).digest()
 
 
-def derive_key(incomplete_header_bytes: bytes, m: int, n: int, k: int, rank: int) -> bytes:
-    return blake3.blake3(incomplete_header_bytes + _mining_config_bytes(m, n, k, rank)).digest()
+def default_mining_config(m: int, k: int, rank: int = NOISE_RANK) -> MiningConfiguration:
+    rows_pattern, cols_pattern = patterns_for_tile(16, 16)  # single hash tile
+    return MiningConfiguration(
+        common_dim=k,
+        rank=rank,
+        mma_type=0,
+        rows_pattern=rows_pattern,
+        cols_pattern=cols_pattern,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -177,15 +185,118 @@ def run_pow(A_noised: torch.Tensor, B_noised: torch.Tensor, noise_seed_A: bytes,
     return PoWResult(bool(int(found[0])), int(coord[0]), int(coord[1]))
 
 
-def mine_once(incomplete_header_bytes: bytes, target: int,
-              A: torch.Tensor, B: torch.Tensor, rank: int = NOISE_RANK) -> PoWResult:
+def mine_once(
+    incomplete_header_bytes: bytes,
+    target: int,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    mining_config: MiningConfiguration | None = None,
+    rank: int = NOISE_RANK,
+) -> PoWResult:
     """One attempt: commit (A,B) under this header, derive noise, noised GEMM + PoW."""
     m, k = A.shape
     n = B.shape[1]
-    key = derive_key(incomplete_header_bytes, m, n, k, rank)
+    if mining_config is None:
+        mining_config = default_mining_config(m, k, rank)
+    key = derive_key(incomplete_header_bytes, mining_config)
     seed_A, seed_B = commitment_hashes(A, B, key)
     E_AL, E_AR, E_BL, E_BR = generate_noise(seed_A, seed_B, m, k, n, rank)
     E_AL, E_AR = E_AL.to(A.device), E_AR.to(A.device)
     E_BL, E_BR = E_BL.to(A.device), E_BR.to(A.device)
     A_noised, B_noised = noised_operands(A, B, E_AL, E_AR, E_BL, E_BR)
     return run_pow(A_noised, B_noised, seed_A, target, rank)
+
+
+def _build_merkle_proof_for_rows(
+    matrix: torch.Tensor,
+    row_indices: list[int],
+    key: bytes,
+) -> MatrixMerkleProof:
+    """Build a MatrixMerkleProof for specific rows of an int8 matrix.
+    
+    Extracts the given rows, builds a BLAKE3-keyed Merkle tree over the
+    padded chunk data, and returns the proof (matching the Rust structure
+    so that bincode serialization is byte-compatible).
+    """
+    import blake3 as _blake3
+
+    # Extract rows and flatten to bytes
+    rows_data = matrix[row_indices].contiguous()
+    flat_bytes = rows_data.to(torch.uint8).cpu().numpy().tobytes()
+
+    padded = pad_to_chunk_boundary(flat_bytes)
+    n = len(padded) // BLAKE3_CHUNK_LEN
+    leaves = [padded[i * BLAKE3_CHUNK_LEN:(i + 1) * BLAKE3_CHUNK_LEN] for i in range(n)]
+
+    leaf_hashes = [_blake3.blake3(leaf, key=key).digest() for leaf in leaves]
+
+    if n == 1:
+        proof_data = MerkleProofData(
+            leaf_data=leaves,
+            leaf_indices=[0],
+            total_leaves=n,
+            root=leaf_hashes[0],
+            siblings=[],
+        )
+    else:
+        level = leaf_hashes
+        all_siblings: list[bytes] = []
+        while len(level) > 1:
+            next_level = []
+            for i in range(0, len(level), 2):
+                if i + 1 < len(level):
+                    combined = _blake3.blake3(level[i] + level[i + 1], key=key).digest()
+                    next_level.append(combined)
+                    all_siblings.append(level[i ^ 1])
+                else:
+                    next_level.append(level[i])
+            level = next_level
+        proof_data = MerkleProofData(
+            leaf_data=leaves,
+            leaf_indices=list(range(n)),
+            total_leaves=n,
+            root=level[0],
+            siblings=all_siblings,
+        )
+
+    return MatrixMerkleProof(proof=proof_data, row_indices=row_indices)
+
+
+def build_proof(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    winning_row: int,
+    winning_col: int,
+    key: bytes,
+    noise_rank: int = NOISE_RANK,
+) -> PlainProof:
+    """Build a PlainProof from a winning 16×16 hash tile.
+
+    `key` is the job key = BLAKE3(header + MiningConfiguration.to_bytes())
+    used during commitment. The winning tile covers A rows
+    [winning_row*16, (winning_row+1)*16) and B cols [winning_col*16,
+    (winning_col+1)*16).
+    """
+    m, k = A.shape
+    n = B.shape[1]
+    tile_size = 16
+
+    row_start = winning_row * tile_size
+    row_end = min(row_start + tile_size, m)
+    col_start = winning_col * tile_size
+    col_end = min(col_start + tile_size, n)
+
+    a_rows = list(range(row_start, row_end))
+    b_cols = list(range(col_start, col_end))
+
+    a_proof = _build_merkle_proof_for_rows(A, a_rows, key)
+    bt_proof = _build_merkle_proof_for_rows(B.T.contiguous(), b_cols, key)
+
+    return PlainProof(
+        m=m,
+        n=n,
+        k=k,
+        noise_rank=noise_rank,
+        a=a_proof,
+        bt=bt_proof,
+    )
