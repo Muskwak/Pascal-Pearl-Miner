@@ -173,11 +173,15 @@ def generate_matrices(
     seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate random int8 matrices A (m×k) and B (k×n) for mining."""
-    rng = torch.Generator()
+    from torch import cuda
     if seed is not None:
+        rng = torch.Generator(device=cuda.current_device() if cuda.is_available() else 'cpu')
         rng.manual_seed(seed)
-    A = torch.randint(signal_min, signal_max + 1, (m, k), dtype=torch.int8, generator=rng)
-    B = torch.randint(signal_min, signal_max + 1, (k, n), dtype=torch.int8, generator=rng)
+        A = torch.randint(signal_min, signal_max + 1, (m, k), dtype=torch.int8, generator=rng)
+        B = torch.randint(signal_min, signal_max + 1, (k, n), dtype=torch.int8, generator=rng)
+    else:
+        A = torch.randint(signal_min, signal_max + 1, (m, k), dtype=torch.int8, device='cuda')
+        B = torch.randint(signal_min, signal_max + 1, (k, n), dtype=torch.int8, device='cuda')
     return A, B
 
 
@@ -239,59 +243,19 @@ def mine_once(
     return run_pow(A_noised, B_noised, seed_A, target, rank)
 
 
-def _build_merkle_proof_for_rows(
-    matrix: torch.Tensor,
-    row_indices: list[int],
-    key: bytes,
-) -> MatrixMerkleProof:
-    """Build a MatrixMerkleProof for specific rows of an int8 matrix.
-    
-    Extracts the given rows, builds a BLAKE3-keyed Merkle tree over the
-    padded chunk data, and returns the proof (matching the Rust structure
-    so that bincode serialization is byte-compatible).
-    """
-    import blake3 as _blake3
+# Real Rust serialization + verifier. Without it we cannot build a
+# consensus-valid proof, so build_proof/verify require it.
+try:
+    import pearl_mining as _pm
+except ImportError:  # pragma: no cover
+    _pm = None
 
-    # Extract rows and flatten to bytes
-    rows_data = matrix[row_indices].contiguous()
-    flat_bytes = rows_data.to(torch.uint8).cpu().numpy().tobytes()
 
-    padded = pad_to_chunk_boundary(flat_bytes)
-    n = len(padded) // BLAKE3_CHUNK_LEN
-    leaves = [padded[i * BLAKE3_CHUNK_LEN:(i + 1) * BLAKE3_CHUNK_LEN] for i in range(n)]
-
-    leaf_hashes = [_blake3.blake3(leaf, key=key).digest() for leaf in leaves]
-
-    if n == 1:
-        proof_data = MerkleProofData(
-            leaf_data=leaves,
-            leaf_indices=[0],
-            total_leaves=n,
-            root=leaf_hashes[0],
-            siblings=[],
-        )
-    else:
-        level = leaf_hashes
-        all_siblings: list[bytes] = []
-        while len(level) > 1:
-            next_level = []
-            for i in range(0, len(level), 2):
-                if i + 1 < len(level):
-                    combined = _blake3.blake3(level[i] + level[i + 1], key=key).digest()
-                    next_level.append(combined)
-                    all_siblings.append(level[i ^ 1])
-                else:
-                    next_level.append(level[i])
-            level = next_level
-        proof_data = MerkleProofData(
-            leaf_data=leaves,
-            leaf_indices=list(range(n)),
-            total_leaves=n,
-            root=level[0],
-            siblings=all_siblings,
-        )
-
-    return MatrixMerkleProof(proof=proof_data, row_indices=row_indices)
+def _matrix_merkle_tree(matrix_int8: torch.Tensor, key: bytes):
+    """Keyed BLAKE3 Merkle tree over the chunk-padded matrix bytes (full matrix)."""
+    flat = matrix_int8.to(torch.uint8).cpu().numpy().tobytes()
+    padded = _pm.pad_to_chunk_boundary(flat)
+    return _pm.MerkleTree(padded, key)
 
 
 def build_proof(
@@ -301,34 +265,48 @@ def build_proof(
     winning_col: int,
     key: bytes,
     noise_rank: int = NOISE_RANK,
-) -> PlainProof:
-    """Build a PlainProof from a winning 16×16 hash tile.
+):
+    """Build a CONSENSUS-VALID PlainProof for a winning 16×16 hash tile.
 
-    `key` is the job key = BLAKE3(header + MiningConfiguration.to_bytes())
-    used during commitment. The winning tile covers A rows
-    [winning_row*16, (winning_row+1)*16) and B cols [winning_col*16,
-    (winning_col+1)*16).
+    Uses the real Rust `pearl_mining` types: a multi-leaf Merkle proof over the
+    FULL chunk-padded matrix (so the proof root equals the committed root). The
+    earlier hand-rolled version hashed only the extracted rows, producing a
+    wrong root — the cause of silent share rejection.
+
+    `key` = job key = BLAKE3(header + MiningConfiguration.to_bytes()).
     """
+    if _pm is None:
+        raise ImportError(
+            "pearl_mining (py-pearl-mining) is required to build valid proofs; "
+            "build it with `maturin build --release` in pearl-ref/py-pearl-mining."
+        )
     m, k = A.shape
     n = B.shape[1]
-    tile_size = 16
+    TILE = 16
+    a_rows = list(range(winning_row, min(winning_row + TILE, m)))
+    b_cols = list(range(winning_col, min(winning_col + TILE, n)))
 
-    row_start = winning_row * tile_size
-    row_end = min(row_start + tile_size, m)
-    col_start = winning_col * tile_size
-    col_end = min(col_start + tile_size, n)
+    tree_A = _matrix_merkle_tree(A, key)
+    tree_B = _matrix_merkle_tree(B.t().contiguous(), key)
+    li_A = _pm.MerkleTree.compute_leaf_indices_from_rows(a_rows, (m, k))
+    li_B = _pm.MerkleTree.compute_leaf_indices_from_rows(b_cols, (n, k))
+    mp_A = _pm.MatrixMerkleProof(tree_A.get_multileaf_proof(li_A), a_rows)
+    mp_B = _pm.MatrixMerkleProof(tree_B.get_multileaf_proof(li_B), b_cols)
+    return _pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B)
 
-    a_rows = list(range(row_start, row_end))
-    b_cols = list(range(col_start, col_end))
 
-    a_proof = _build_merkle_proof_for_rows(A, a_rows, key)
-    bt_proof = _build_merkle_proof_for_rows(B.T.contiguous(), b_cols, key)
+def verify_proof_local(incomplete_header_bytes: bytes, proof, nbits: int | None = None):
+    """Locally check a proof with the official Rust verifier before submitting.
 
-    return PlainProof(
-        m=m,
-        n=n,
-        k=k,
-        noise_rank=noise_rank,
-        a=a_proof,
-        bt=bt_proof,
-    )
+    Returns (is_valid, message). `nbits` overrides the header difficulty with the
+    pool share difficulty when provided. Gate every pool submission on this.
+    """
+    if _pm is None:
+        raise ImportError("pearl_mining required for verification")
+    hdr = _pm.IncompleteBlockHeader.from_bytes(incomplete_header_bytes)
+    try:
+        if nbits is not None:
+            return _pm.verify_plain_proof(hdr, proof, nbits)
+        return _pm.verify_plain_proof(hdr, proof)
+    except TypeError:
+        return _pm.verify_plain_proof(hdr, proof)

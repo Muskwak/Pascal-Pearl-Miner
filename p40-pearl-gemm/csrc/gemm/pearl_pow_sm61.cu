@@ -156,6 +156,10 @@ void launch_pearl_pow(
   dim3 grid(num_tiles);
   dim3 block(HT * HT);  // 256
   switch (R) {
+    case 256:
+      pearl_pow_kernel<256><<<grid, block, 0, stream>>>(
+          A, Bt, n, k, pow_key, pow_target, out_digests, found_flag, found_coord);
+      break;
     case 128:
       pearl_pow_kernel<128><<<grid, block, 0, stream>>>(
           A, Bt, n, k, pow_key, pow_target, out_digests, found_flag, found_coord);

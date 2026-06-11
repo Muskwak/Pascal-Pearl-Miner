@@ -242,7 +242,7 @@ class AlphaPoolClient:
 
     def __init__(self, host: str, port: int, wallet: str, worker: str = "default"):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(30)
+        self._sock.settimeout(60)
         self._sock.connect((host, port))
         self._reader = self._sock.makefile("r", encoding="utf-8")
         self._writer = self._sock.makefile("w", encoding="utf-8")

@@ -355,16 +355,38 @@ nothing at the hardest target. The cheap steps (noise gen, noised operands) are
 faithful torch/BLAKE3 ports of `noise_generation.py` / `noisy_gemm.py`; the hot
 path is the validated `pearl_pow` CUDA kernel.
 
-## Remaining work for live mining
+## ✅✅ P40 produces CONSENSUS-VALID proofs (official Rust verifier)
 
-1. **Pool miner validation on P40.** Run `pool_miner.py` on the P40 machine
-   where `p40_pearl_gemm_cuda` is built. The pool's `difficulty=32` should yield
-   a valid share quickly. If accepted, the protocol format is confirmed.
-2. **If share submission is silently rejected**, the pool may require a full
-   76-byte `IncompleteBlockHeader` (with `prev_block=seed`, `merkle_root=0`,
-    `timestamp=now`, `nbits` from difficulty) instead of the raw 32-byte seed,
-    or a different `job_id` format.  Revise `pool_miner.py` accordingly.
-3. **Perf:** move noise gen / noised-operand matmuls from torch onto the existing
+`py-pearl-mining` (real Rust serialization + `verify_plain_proof`) **builds on
+this machine** (cargo 1.94 + maturin) — the "unavailable on Windows" note was
+wrong. `tests/test_valid_proof.py`: the **P40 `pearl_pow` kernel finds a tile,
+`pearl_mining` builds the `PlainProof`, and `verify_plain_proof` →
+"Mining solution verified successfully"**. Definitive: a P40 computes valid PoW.
+
+Fixes/learnings from the verifier: `k ≥ 16·rank`; signal range `[-64,64]`;
+matrices committed as keyed-BLAKE3 Merkle trees over **1024-byte chunk-padded**
+bytes; `config.to_bytes()`=52B; `IncompleteBlockHeader`=76B. `pearl_miner.build_proof`
+now uses the real `pearl_mining` (full-matrix multi-leaf proof) and
+`verify_proof_local()` gates submission — the old hand-rolled `build_proof`
+hashed only the extracted rows (wrong root) = the real cause of silent drops.
+
+## Remaining work for live mining — the pool WIRE PROTOCOL only
+
+Compute + proof are done and locally verifiable; the last gap is pool transport,
+which is undocumented with no feedback:
+- `pool.pearlhash.xyz:9000` is **silent** to every login/subscribe variant.
+- AlphaPool sends `pearl.challenge {seed(32B), difficulty}` but the **32-byte
+  seed → 76-byte `IncompleteBlockHeader`** mapping is unknown, so the job_key
+  can't be reproduced from the pool seed.
+
+**Deterministic path (recommended): solo via `pearld` + `pearl-gateway`** —
+`getMiningInfo` returns the real 76-byte `incomplete_header_bytes` + target;
+`submitPlainProof` takes the base64 proof. `gateway_client.MiningClient` +
+`pearl_miner.build_proof`/`verify_proof_local` are ready; no guessing. Pool path
+needs the bridge protocol docs or a capture of the official `pearl-miner-v4`.
+
+### Other follow-ups
+- **Perf:** move noise gen / noised-operand matmuls from torch onto the existing
    CUDA kernels (`noise_gen`, `noise_A`, `noise_B`) and fuse; tune `pearl_pow`.
 4. **Optional Pascal denoise-subtract** for the actual inference output (only the
    "useful work" result, not the PoW share).
