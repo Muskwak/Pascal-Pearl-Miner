@@ -18,3 +18,10 @@ __pycache__/
 *.log
 sniffer_stdout.log
 pool_capture.log
+
+p40-pearl-gemm/*.txt
+p40-pearl-gemm/*.sqlite
+p40-pearl-gemm/*.nsys-rep
+p40-pearl-gemm/profile_standalone*
+p40-pearl-gemm/profile_analysis*
+p40-pearl-gemm/tests/prof_stall.py

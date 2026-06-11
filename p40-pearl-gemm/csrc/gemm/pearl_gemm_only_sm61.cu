@@ -23,15 +23,18 @@
 using namespace cute;
 
 static __device__ __forceinline__ int dp4a_go(int a, int b, int c) {
-  int r;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
-  asm volatile("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+  // Use the intrinsic, NOT inline `asm volatile`: volatile is a scheduling
+  // barrier that forbids ptxas from interleaving the dp4a with LDS loads and
+  // other warps' work. This kernel is dp4a-latency/scheduling bound, so letting
+  // the compiler reorder freely is the win.
+  return __dp4a(a, b, c);
 #else
-  r = c;
+  int r = c;
   for (int i = 0; i < 4; ++i)
     r += int((int8_t)((a >> (i * 8)) & 0xFF)) * int((int8_t)((b >> (i * 8)) & 0xFF));
-#endif
   return r;
+#endif
 }
 
 static __device__ __forceinline__ uint32_t rotl32_go(uint32_t x, int n) {
@@ -142,13 +145,20 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
 #pragma unroll
         for (int j = 0; j < RN; ++j)
           b2[j] = *reinterpret_cast<const int2*>(&br[j][kk]);
+        // Two independent passes (.x then .y) rather than a dependent .x->.y
+        // pair per acc: this spaces each accumulator's dependent dp4a by 8
+        // independent dp4a, hiding the dp4a latency within the warp. Bit-exact
+        // (same order: ((acc + x_products) + y_products)).
 #pragma unroll
         for (int i = 0; i < RM; ++i)
 #pragma unroll
-          for (int j = 0; j < RN; ++j) {
-            int acumm = dp4a_go(a2[i].x, b2[j].x, acc[i * RN + j]);
-            acc[i * RN + j] = dp4a_go(a2[i].y, b2[j].y, acumm);
-          }
+          for (int j = 0; j < RN; ++j)
+            acc[i * RN + j] = dp4a_go(a2[i].x, b2[j].x, acc[i * RN + j]);
+#pragma unroll
+        for (int i = 0; i < RM; ++i)
+#pragma unroll
+          for (int j = 0; j < RN; ++j)
+            acc[i * RN + j] = dp4a_go(a2[i].y, b2[j].y, acc[i * RN + j]);
       }
     }
     // R-wide reduction window complete: sample the running accumulator.
