@@ -188,32 +188,60 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
 
     RS = region
     tgt_t = torch.frombuffer(bytearray(int(bound).to_bytes(32, "little")), dtype=torch.uint8).to(dev)
+    tiles_per_region = (RS // 16) ** 2
     searched = 0
+    search_t0 = time.time()
+    last_print = search_t0
+    # Bt_ns depends only on the column block c0 (not r0), so cache the noised,
+    # contiguous column operands per job. Without this the FP32 noise-matmul was
+    # recomputed 32x per c0 (once for every r0) — the main reason the live miner
+    # ran ~4.7 TH/s vs the ~7.5 TH/s kernel benchmark. 32 blocks * 16MB = 512MB.
+    bt_cache: dict[int, torch.Tensor] = {}
+
+    def bt_noised(c0):
+        cached = bt_cache.get(c0)
+        if cached is None:
+            Bt_cols = B[:, c0:c0+RS].t().contiguous()                    # [RS,K] = B^T[cols]
+            cached = (Bt_cols.int() + _imatmul_i8(EBR[c0:c0+RS], E_BLt).int()).to(torch.int8).contiguous()
+            bt_cache[c0] = cached
+        return cached
+
     for r0 in range(0, M, RS):
-        A_ns = (A[r0:r0+RS].int() + _imatmul_i8(EAL[r0:r0+RS], EAR).int()).to(torch.int8)
+        A_nc = (A[r0:r0+RS].int() + _imatmul_i8(EAL[r0:r0+RS], EAR).int()).to(torch.int8).contiguous()
         for c0 in range(0, N, RS):
             if max_regions and searched >= max_regions:
-                log(f"  searched {searched} regions, no hit; next job"); return None
+                elapsed = time.time() - search_t0
+                ths = searched * tiles_per_region / elapsed / 1e6 if elapsed > 0 else 0
+                log(f"  {searched} regions ({ths:.2f} TH/s); no hit, next job")
+                return None
             newer = pool.check_newer_job(job_id)
             if newer is not None:
-                log(f"  job superseded after {searched} regions; abandoning for fresh job")
+                elapsed = time.time() - search_t0
+                ths = searched * tiles_per_region / elapsed / 1e6 if elapsed > 0 else 0
+                log(f"  {searched} regions ({ths:.2f} TH/s); job superseded, abandoning for fresh job")
                 return ("NEWJOB", newer)
             searched += 1
-            Bt_cols = B[:, c0:c0+RS].t().contiguous()                    # [RS,K] = B^T[cols]
-            Bt_ns = (Bt_cols.int() + _imatmul_i8(EBR[c0:c0+RS], E_BLt).int()).to(torch.int8)
+            if time.time() - last_print >= 5:
+                elapsed = time.time() - search_t0
+                ths = searched * tiles_per_region / elapsed / 1e6 if elapsed > 0 else 0
+                log(f"  {searched} regions searched ({ths:.2f} TH/s)")
+                last_print = time.time()
+            Bt_ns = bt_noised(c0)
 
             # split pipeline (GEMM-only -> transcript buffer -> BLAKE3), variant 1
             # = S=128 staging, 4x4, MINB4. Decoupling the shared-staging width (128)
             # from the R=256 reduction window halves shared mem (~33KB->~17KB/block),
             # lifting occupancy from 2 blocks/SM (shared-bound) to 4 blocks/SM (100%
             # thread occupancy). ~7.25 TH/s, +21% over full-width S=256. Bit-exact.
-            _, found, coord = miner._C.pearl_pow_split(A_ns.contiguous(), Bt_ns.contiguous(), key_t, tgt_t, R, 1)
+            _, found, coord = miner._C.pearl_pow_split(A_nc, Bt_ns, key_t, tgt_t, R, 1)
             torch.cuda.synchronize()
             if int(found[0]) != 1:
                 continue
 
             gr, gc = r0 + int(coord[0]), c0 + int(coord[1])
-            log(f"  HIT tile (row={gr}, col={gc}) after {searched} regions; building proof...")
+            elapsed = time.time() - search_t0
+            ths = searched * tiles_per_region / elapsed / 1e6 if elapsed > 0 else 0
+            log(f"  HIT tile (row={gr}, col={gc}) after {searched} regions ({ths:.2f} TH/s); building proof...")
             proof = miner.build_proof(A, B, gr, gc, key, R)             # validated full-matrix proof
             try:
                 v, vmsg = miner.verify_proof_local(header, proof)
@@ -221,7 +249,9 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
             except Exception as e:
                 log(f"  local verify error: {e}")
             return proof.to_base64()
-    log("  no hit in searched regions for this job")
+    elapsed = time.time() - search_t0
+    ths = searched * tiles_per_region / elapsed / 1e6 if elapsed > 0 else 0
+    log(f"  {searched} regions searched ({ths:.2f} TH/s); no hit in this job")
     return None
 
 
