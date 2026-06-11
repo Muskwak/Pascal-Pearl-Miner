@@ -31,6 +31,20 @@ On Windows:
 run_luckypool.bat --wallet prl1YOURWALLET --worker p40
 ```
 
+## Standalone binary (no Python/torch needed)
+
+A self-contained **~60 MB** binary (torch-free) is built with:
+
+```
+packaging\build_windows.bat       # Windows -> dist\p40-miner\
+bash packaging/build_linux.sh     # Linux   -> dist/p40-miner/   (build on Linux)
+```
+
+It bundles its own Python, the 655 KB CUDA library, and `cudart` — users only
+need an NVIDIA driver. Share the whole `dist/p40-miner/` folder. (The Python
+entry point is `python/miner_capi.py`; the legacy torch miner is
+`python/luckypool_miner.py`.)
+
 ## Dev fee
 
 This miner includes a **2% dev fee**: 2% of cumulative mining time mines to the

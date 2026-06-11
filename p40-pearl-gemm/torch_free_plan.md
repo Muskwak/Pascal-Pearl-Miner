@@ -1,4 +1,12 @@
-# Torch-free miner — plan for a <100 MB standalone binary
+# Torch-free miner — DONE: 60 MB standalone binary (was 4.5 GB)
+
+> **STATUS: COMPLETE.** All 5 phases shipped and gated. The frozen torch-free
+> binary is **60 MB** (75x smaller than the 4.5 GB torch bundle) and landed an
+> accepted share on luckypool running self-contained (its own bundled Python,
+> no torch/conda). Build: `packaging/build_windows.bat` (or `build_linux.sh`).
+> Entry: `python/miner_capi.py`. Gates: `tests/test_capi_phase{1,2,3,4}.py`.
+
+
 
 ## Why the binary is 4.5 GB today
 PyInstaller bundles CUDA PyTorch: `torch/lib` alone is **4.26 GB**. Everything else
