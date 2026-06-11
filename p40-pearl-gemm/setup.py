@@ -44,6 +44,8 @@ sources = [
     "csrc/gemm/api_sm61.cu",
     "csrc/gemm/pearl_pow_sm61.cu",
     "csrc/gemm/pearl_pow_fused_sm61.cu",
+    "csrc/gemm/pearl_gemm_only_sm61.cu",
+    "csrc/gemm/pearl_blake3_sm61.cu",
 
     # Architecture-independent kernels from upstream pearl-gemm
     "csrc/blake3/blake3.cu",

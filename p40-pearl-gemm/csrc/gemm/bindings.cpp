@@ -59,6 +59,20 @@ void launch_pearl_pow_fused_v(
     uint8_t* out_digests, int* found_flag, int* found_coord,
     int variant, cudaStream_t stream);
 
+// GEMM-only variant (definition in pearl_gemm_only_sm61.cu) — writes transcript
+// to global buffer, no BLAKE3.
+void launch_pearl_gemm_only(
+    const int8_t* A, const int8_t* Bt, int m, int n, int k, int R,
+    uint32_t* transcript_buffer, int variant, cudaStream_t stream);
+
+// BLAKE3-only kernel (definition in pearl_blake3_sm61.cu) — consumes transcript
+// buffer, produces digests + found-flag.
+void launch_pearl_blake3(
+    const uint32_t* transcript_buffer, int num_tiles, int n,
+    const uint32_t* pow_key, const uint32_t* pow_target,
+    uint8_t* out_digests, int* found_flag, int* found_coord,
+    cudaStream_t stream);
+
 // tensor_hash host entry (definition in tensor_hash.cu -> tensor_hash_host_sm61.hpp)
 void tensor_hash(
     const uint8_t* data, uint32_t data_size, uint8_t* out,
@@ -253,6 +267,79 @@ std::vector<at::Tensor> pearl_pow_fused(at::Tensor A, at::Tensor Bt,
   return {digests, found, coord};
 }
 
+// GEMM-only kernel: writes 16-word transcript per tile to the provided buffer.
+// transcript_buffer must be [num_tiles, 16] int32, caller-allocated on the device.
+void pearl_gemm_only(at::Tensor A, at::Tensor Bt,
+                     at::Tensor transcript_buffer,
+                     int64_t R, int64_t variant) {
+  TORCH_CHECK(A.is_cuda() && Bt.is_cuda(), "pearl_gemm_only: A/Bt must be CUDA");
+  TORCH_CHECK(A.scalar_type() == at::kChar && Bt.scalar_type() == at::kChar,
+              "pearl_gemm_only: A/Bt must be int8");
+  TORCH_CHECK(A.is_contiguous() && Bt.is_contiguous(),
+              "pearl_gemm_only: A/Bt must be contiguous");
+  TORCH_CHECK(transcript_buffer.is_cuda() &&
+              transcript_buffer.scalar_type() == at::kInt,
+              "pearl_gemm_only: transcript_buffer must be CUDA int32");
+  const int m = (int)A.size(0), k = (int)A.size(1), n = (int)Bt.size(0);
+  TORCH_CHECK(Bt.size(1) == k, "pearl_gemm_only: A[k] must match Bt[k]");
+  TORCH_CHECK(m % 64 == 0 && n % 64 == 0 && k % R == 0,
+              "pearl_gemm_only: require m%64==0, n%64==0, k%R==0");
+  TORCH_CHECK(R == 256 || R == 128 || R == 64,
+              "pearl_gemm_only: R must be 64, 128, or 256");
+
+  const c10::cuda::CUDAGuard device_guard(A.device());
+  launch_pearl_gemm_only(
+      A.data_ptr<int8_t>(), Bt.data_ptr<int8_t>(), m, n, k, (int)R,
+      reinterpret_cast<uint32_t*>(transcript_buffer.data_ptr()),
+      (int)variant, cur_stream());
+}
+
+// Two-step kernel: GEMM-only → transcript buffer → BLAKE3-only.
+// Returns {digests[num_tiles,32] uint8, found[1] int32, coord[2] int32}.
+// Same semantics as pearl_pow_fused but with higher occupancy in the GEMM step.
+std::vector<at::Tensor> pearl_pow_split(at::Tensor A, at::Tensor Bt,
+                                        at::Tensor pow_key,
+                                        at::Tensor pow_target,
+                                        int64_t R, int64_t variant) {
+  TORCH_CHECK(A.is_cuda() && Bt.is_cuda(), "pearl_pow_split: A/Bt must be CUDA");
+  TORCH_CHECK(A.scalar_type() == at::kChar && Bt.scalar_type() == at::kChar,
+              "pearl_pow_split: A/Bt must be int8");
+  TORCH_CHECK(A.is_contiguous() && Bt.is_contiguous(),
+              "pearl_pow_split: A/Bt must be contiguous");
+  TORCH_CHECK(pow_key.numel() == 32 && pow_target.numel() == 32,
+              "pearl_pow_split: pow_key/pow_target must be 32 bytes");
+  const int m = (int)A.size(0), k = (int)A.size(1), n = (int)Bt.size(0);
+  TORCH_CHECK(Bt.size(1) == k, "pearl_pow_split: A[k] must match Bt[k]");
+  TORCH_CHECK(m % 64 == 0 && n % 64 == 0 && k % R == 0,
+              "pearl_pow_split: require m%64==0, n%64==0, k%R==0");
+  TORCH_CHECK(R == 256 || R == 128 || R == 64,
+              "pearl_pow_split: R must be 64, 128, or 256");
+
+  const c10::cuda::CUDAGuard device_guard(A.device());
+  const int num_tiles = (m / 16) * (n / 16);
+  auto u8 = at::TensorOptions().dtype(at::kByte).device(A.device());
+  auto i32 = at::TensorOptions().dtype(at::kInt).device(A.device());
+  auto digests = at::empty({num_tiles, 32}, u8);
+  auto found = at::zeros({1}, i32);
+  auto coord = at::full({2}, -1, i32);
+  auto transcript_buffer = at::zeros({num_tiles, 16}, i32);
+
+  launch_pearl_gemm_only(
+      A.data_ptr<int8_t>(), Bt.data_ptr<int8_t>(), m, n, k, (int)R,
+      reinterpret_cast<uint32_t*>(transcript_buffer.data_ptr()),
+      (int)variant, cur_stream());
+
+  launch_pearl_blake3(
+      reinterpret_cast<const uint32_t*>(transcript_buffer.data_ptr()),
+      num_tiles, n,
+      reinterpret_cast<const uint32_t*>(pow_key.data_ptr()),
+      reinterpret_cast<const uint32_t*>(pow_target.data_ptr()),
+      digests.data_ptr<uint8_t>(), found.data_ptr<int>(),
+      coord.data_ptr<int>(), cur_stream());
+
+  return {digests, found, coord};
+}
+
 // Generate the Pearl noise tensors on the GPU from the commitment keys.
 // Returns {EAL[m,R], EAR[R,k], EBL[k,R], EBR[n,R]} int8 (matches Python
 // generate_noise: EAL/EBR uniform, EAR/EBL sparse-perm; seeds "A_tensor"/"B_tensor").
@@ -297,6 +384,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("pow_target"), pybind11::arg("R") = 128);
   m.def("pearl_pow_fused", &pearl_pow_fused,
         "Fused high-throughput Pearl PoW (warp-per-tile, shared-mem reuse)",
+        pybind11::arg("A"), pybind11::arg("Bt"), pybind11::arg("pow_key"),
+        pybind11::arg("pow_target"), pybind11::arg("R") = 256,
+        pybind11::arg("variant") = 0);
+  m.def("pearl_gemm_only", &pearl_gemm_only,
+        "GEMM-only: compute transcripts into global buffer (no BLAKE3). "
+        "Higher occupancy than pearl_pow_fused.",
+        pybind11::arg("A"), pybind11::arg("Bt"),
+        pybind11::arg("transcript_buffer"),
+        pybind11::arg("R") = 256, pybind11::arg("variant") = 0);
+  m.def("pearl_pow_split", &pearl_pow_split,
+        "Two-step PoW: GEMM-only → transcript buffer → BLAKE3-only. "
+        "Same semantics as pearl_pow_fused but higher occupancy.",
         pybind11::arg("A"), pybind11::arg("Bt"), pybind11::arg("pow_key"),
         pybind11::arg("pow_target"), pybind11::arg("R") = 256,
         pybind11::arg("variant") = 0);

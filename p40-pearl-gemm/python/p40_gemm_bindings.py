@@ -133,6 +133,29 @@ def noise_gen(
     )
 
 
+def pearl_gemm_only(
+    A: torch.Tensor,
+    Bt: torch.Tensor,
+    transcript_buffer: torch.Tensor,
+    R: int = 256,
+    variant: int = 0,
+):
+    _check_import()
+    _C.pearl_gemm_only(A, Bt, transcript_buffer, R, variant)
+
+
+def pearl_pow_split(
+    A: torch.Tensor,
+    Bt: torch.Tensor,
+    pow_key: torch.Tensor,
+    pow_target: torch.Tensor,
+    R: int = 256,
+    variant: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _check_import()
+    return _C.pearl_pow_split(A, Bt, pow_key, pow_target, R, variant)
+
+
 def tensor_hash(
     data: torch.Tensor,
     key: torch.Tensor,

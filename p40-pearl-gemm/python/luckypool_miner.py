@@ -202,8 +202,12 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
             Bt_cols = B[:, c0:c0+RS].t().contiguous()                    # [RS,K] = B^T[cols]
             Bt_ns = (Bt_cols.int() + _imatmul_i8(EBR[c0:c0+RS], E_BLt).int()).to(torch.int8)
 
-            # fused kernel variant 1 (4x4 MINB2): ~5.9 TH/s on P40, bit-exact transcript
-            _, found, coord = miner._C.pearl_pow_fused(A_ns.contiguous(), Bt_ns.contiguous(), key_t, tgt_t, R, 1)
+            # split pipeline (GEMM-only -> transcript buffer -> BLAKE3), variant 0
+            # = 4x4 MINB3 (75% occupancy). Shedding the keyed-BLAKE3 registers from
+            # the GEMM kernel lifts occupancy 50%->75%; with conflict-free scalar
+            # shared loads (SAW=RW+1) this is ~5.95 TH/s, beating fused (~5.5-5.8,
+            # higher variance) and far steadier. See tests/bench_split.py.
+            _, found, coord = miner._C.pearl_pow_split(A_ns.contiguous(), Bt_ns.contiguous(), key_t, tgt_t, R, 0)
             torch.cuda.synchronize()
             if int(found[0]) != 1:
                 continue

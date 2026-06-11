@@ -12,42 +12,52 @@ So **1 Mtile/s ≈ 1.0486 TH/s**. Each tile = 16×16×4096 = 2^20 INT8 MACs = 2^
 - **GTX 1070** (sm_61): ~weaker; useful as a 2nd device for aggregate.
 - User target **25 TH/s** is above one P40's theoretical peak → needs P40 + 1070 + an efficient kernel.
 
-## Progress (region 16384, full scan, P40)
+## Progress (real config: region 4096, k=4096, R=256, P40)
 | Stage | Mtiles/s | TH/s | ×naive | Note |
 |------|---------|------|--------|------|
 | naive `pearl_pow` | 0.46 | 0.48 | 1× | one block/tile, 128 __syncthreads/tile |
 | fused warp/tile + `__shfl_xor` | 1.98 | 2.08 | 4.3× | shared-mem operand reuse |
 | + bank-conflict padding (stride 65) | 2.34 | 2.46 | 5.1× | row stride coprime to 32 banks |
 | + 4×2 register blocking | 3.13 | 3.28 | 6.8× | 0.75 shared-loads/dp4a, ILP |
-| **+ MINB2 occupancy (variant 1)** | **5.64** | **5.91** | **12.3×** | 2 blocks/SM = 50% occupancy |
+| + MINB2 occupancy (fused variant 1) | 5.25 | 5.5 | 11.4× | 2 blocks/SM = 50% occupancy |
+| **+ split BLAKE3 → GEMM-only MINB3 (split v0)** | **5.68** | **5.95** | **12.4×** | 3 blocks/SM = 75% occupancy, steady |
 
-Current best: **variant 1 (4×4 region, `__launch_bounds__(512,2)`)** — the miner uses it.
-At 5.64 Mtiles/s we are at ~25% of dp4a peak; occupancy-limited at 50%.
+Current best: **`pearl_pow_split` variant 0 (GEMM-only 4×4 MINB3 + BLAKE3 pass)** — the miner uses it.
+At ~5.68 Mtiles/s we are at ~28% of dp4a peak; still occupancy/latency-limited.
+
+> **Measurement note.** All numbers above are at the *real* mining config (k=4096).
+> An earlier split benchmark at k=16384 (4× the real k) overstated the split win at
+> +23–28%; at real k the GEMM compute is smaller so the transcript round-trip costs
+> relatively more. The honest win is ~+3–8% **and** much lower run-to-run variance
+> (the lean GEMM-only kernel has no BLAKE3 register pressure). The `int4` vectorized
+> loads were a **regression**: their 16-B-aligned stride (RW+4)&~3 = 68 has 68 mod 32
+> = 4, reintroducing bank conflicts that outweigh the fewer load instructions. Reverted
+> to conflict-free scalar loads at stride RW+1 = 65.
 
 ## Diagnosis
 - Bottleneck history: barriers → shared-load ratio → **occupancy**.
-- The cute keyed-BLAKE3 (per-tile, lane 0) needs ~100 regs and dominates the kernel's
-  register footprint; capping regs (MINB2) to reach 2 blocks/SM is the current win, but
-  pushing to MINB3/4 over-spills BLAKE3 and regresses. So registers (BLAKE3) cap occupancy.
+- The cute keyed-BLAKE3 (per-tile, lane 0) needs ~100 regs and dominated the fused
+  kernel's register footprint, capping it at MINB2 (50%). Splitting BLAKE3 into a 2nd
+  1-thread/tile kernel drops the GEMM kernel to ~40 regs → MINB3 (75%) with no spills.
+- Within one warp the micro-tile is **already optimal**: a warp owns one 16×16 tile =
+  256 elts / 32 lanes = 8 elts/lane (fixed), so RM·RN = 8 is forced and (4,2) at 0.75
+  loads/dp4a is the best single-warp ratio. Going below 0.75 needs operand reuse across
+  *multiple* tiles per warp (lever 5).
 
 ## Remaining levers (priority order)
-1. **Split BLAKE3 into a 2nd kernel** *(highest value, ~1.5–2×)*
-   - GEMM kernel computes only the 16-word transcript per tile → writes to a global
-     buffer (num_tiles × 64 B). Without BLAKE3 its reg footprint drops to ~40 → 3–4
-     blocks/SM (75–100% occupancy) without spills.
-   - A 2nd 1-thread/tile kernel does keyed BLAKE3 + target compare over the transcript
-     buffer (cheap; ~64 MB for 1M tiles, sub-ms).
-   - Must stay bit-exact (transcript bytes identical).
-2. **Vectorized `int4` shared loads** *(~1.2–1.4×)*
-   - Load 4 dp4a-words at once (16 B) per operand fragment to cut load-instruction count;
-     keeps the 4×2 register micro-tile.
+1. ~~**Split BLAKE3 into a 2nd kernel**~~ *(DONE — split v0, +3–8% and steadier)*
+2. ~~**Vectorized `int4` shared loads**~~ *(TRIED — net regression from bank conflicts; reverted)*
 3. **Noised-matmul on GPU INT path** *(removes per-region fp32 matmul overhead)*
    - Replace the `_imatmul_i8` fp32 GEMM (E_AL@E_AR) with the existing `noise_A`/`noise_B`
      INT kernels, or fuse the noise add into the search kernel.
-4. **Multi-GPU dispatch (P40 + 1070)** *(aggregate)*
+4. **Multi-GPU dispatch (P40 + 1070)** *(aggregate, highest remaining value)*
    - Split the output-tile space across both devices; each runs the same kernel on its
      own CUDA stream/process. Aggregate ≈ P40 + 1070 hashrate.
-5. **Larger micro-tiles / bigger blocks** once occupancy is unlocked by (1).
+5. **Multi-tile-per-warp operand reuse** *(the only way below 0.75 loads/dp4a)*
+   - Have each warp compute 2 horizontally-adjacent 16×16 tiles that share the same A
+     rows: load A once, reuse for both tiles' B → 8 loads / 16 dp4a = 0.5 ratio. Needs
+     2 transcript accumulators + 2 XOR reductions per warp (still bit-exact). Bigger
+     restructure; attempt after multi-GPU.
 
 ## Realistic outlook
 - P40 alone, after (1)+(2): ~9–13 TH/s plausible (toward the ~16 TH/s realistic ceiling).

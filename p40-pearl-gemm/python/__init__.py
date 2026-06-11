@@ -6,6 +6,8 @@ from .p40_gemm_bindings import (
     denoise_converter,
     inner_hash,
     noise_gen,
+    pearl_gemm_only,
+    pearl_pow_split,
     tensor_hash,
 )
 
@@ -17,5 +19,7 @@ __all__ = [
     "denoise_converter",
     "inner_hash",
     "noise_gen",
+    "pearl_gemm_only",
+    "pearl_pow_split",
     "tensor_hash",
 ]
