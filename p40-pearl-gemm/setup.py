@@ -94,16 +94,31 @@ include_dirs = [
 ]
 
 # CUTLASS include path. Override with the CUTLASS_DIR env var (pointing at the
-# directory that contains `cutlass/` and `cute/`); falls back to the local
-# aphrodite-engine checkout for backwards compatibility.
-_DEFAULT_CUTLASS = r"C:\Users\ADMIN\audits\aphrodite-engine\.deps\cutlass-src\include"
-cutlass_dir = os.environ.get("CUTLASS_DIR", _DEFAULT_CUTLASS)
-if not (Path(cutlass_dir) / "cutlass").exists():
+# directory that contains `cutlass/` and `cute/`).
+cutlass_dir = os.environ.get("CUTLASS_DIR")
+if not cutlass_dir:
+    # Check common locations
+    candidates = [
+        os.environ.get("HOME", ""),
+        os.environ.get("USERPROFILE", ""),
+    ]
+    for base in candidates:
+        p = Path(base) / ".cache" / "cutlass" / "include"
+        if p.exists() and (p / "cutlass").exists():
+            cutlass_dir = str(p)
+            break
+if not cutlass_dir:
+    # Fallback for this dev machine
+    _DEFAULT_CUTLASS = r"C:\Users\ADMIN\audits\aphrodite-engine\.deps\cutlass-src\include"
+    if Path(_DEFAULT_CUTLASS).exists():
+        cutlass_dir = _DEFAULT_CUTLASS
+if not cutlass_dir:
     print(
-        f"WARNING: CUTLASS headers not found at {cutlass_dir!r}. "
+        "WARNING: CUTLASS headers not found. "
         "Set CUTLASS_DIR to the include dir that contains cutlass/ and cute/.",
         file=sys.stderr,
     )
+    cutlass_dir = "."
 include_dirs.append(cutlass_dir)
 
 # Find CUB (comes with CUDA toolkit)
@@ -135,5 +150,10 @@ setup(
     packages=["p40_pearl_gemm"],
     package_dir={"p40_pearl_gemm": "python"},
     python_requires=">=3.12",
-    install_requires=["torch>=2.0.0"],
+    install_requires=["torch>=2.0.0", "blake3", "numpy"],
+    entry_points={
+        "console_scripts": [
+            "p40-mine=p40_pearl_gemm.luckypool_miner:main",
+        ],
+    },
 )
