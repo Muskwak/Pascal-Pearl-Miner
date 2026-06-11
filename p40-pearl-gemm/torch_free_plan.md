@@ -58,9 +58,11 @@ save enough time to justify the size.
    numpy + blake3 + the small .pyd + `cudart64*.dll`. Target **~50–80 MB**.
 
 ## Phased delivery (each phase has a bit-exactness gate)
-- **P1 — Torch-free backend** (`bindings_raw.cpp` + `cuda-python` mem wrapper).
-  Gate: call `pearl_pow_split` on device buffers and reproduce the existing
-  `test_pearl_pow_split.py` digests bit-for-bit.
+- **P1 — Torch-free backend** ✅ DONE. `csrc/capi/p40_capi.cu` → standalone
+  `p40cuda.dll` (**655 KB**, links cudart only; `packaging/build_capi.{bat,sh}`),
+  driven via stdlib `ctypes`. `error_check.hpp` made torch-free under `P40_NO_TORCH`.
+  Gate PASSED: `tests/test_capi_phase1.py` reproduces the torch `pearl_pow_split`
+  digests bit-for-bit (no torch in the compute path).
 - **P2 — Noise-apply via `noise_A/B`.** Gate: `A_ns`/`Bt_ns` bit-exact vs the
   current `_imatmul_i8` path (and vs the reference noisy_gemm) on a fixed seed.
 - **P3 — RNG + transpose kernels.** Gate: committed roots + a full no-hit sweep

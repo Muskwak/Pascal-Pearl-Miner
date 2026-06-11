@@ -30,3 +30,7 @@ p40-pearl-gemm/tests/prof_stall.py
 dist/
 build_pyi/
 *.spec.bak
+p40cuda.dll
+libp40cuda.so
+*.exp
+*.lib
