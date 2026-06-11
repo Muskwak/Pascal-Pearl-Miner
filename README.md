@@ -31,6 +31,22 @@ On Windows:
 run_luckypool.bat --wallet prl1YOURWALLET --worker p40
 ```
 
+## Dev fee
+
+This miner includes a **2% dev fee**: 2% of cumulative mining time mines to the
+developer's address to fund continued development. This is standard for public
+miners (T-Rex 1%, lolMiner 0.7%, TeamRedMiner 0.75–2.5%, Gminer 1–3%).
+
+It is **fully transparent**:
+- The rate and dev address are printed at startup.
+- Every dev-fee round is logged (`[dev fee] mining to the dev address …`), and
+  accepted shares are tagged `(DEV FEE)` vs `(you)`.
+- The fee is realized in short contiguous rounds (~30 s+) so it converges to 2%
+  over a session; very short sessions (< ~25 min) pay proportionally less.
+
+The rate and address are the `DEV_FEE` / `DEV_ADDRESS` constants at the top of
+`p40-pearl-gemm/python/luckypool_miner.py` — inspect or change them as you wish.
+
 ### Required dependencies
 
 - CUDA Toolkit 12.x

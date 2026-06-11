@@ -25,3 +25,8 @@ p40-pearl-gemm/*.nsys-rep
 p40-pearl-gemm/profile_standalone*
 p40-pearl-gemm/profile_analysis*
 p40-pearl-gemm/tests/prof_stall.py
+
+# PyInstaller build artifacts (multi-GB)
+dist/
+build_pyi/
+*.spec.bak

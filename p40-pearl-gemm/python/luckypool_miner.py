@@ -15,6 +15,10 @@ CPU-class hashrates (a naive P40 search is in that band).
 
     python luckypool_miner.py --wallet prl1... --worker p40 \
         --pool pearl-cpu-eu1.luckypool.io:3370 --region 4096
+
+DEV FEE: this miner mines DEV_FEE (default 2%) of the time to the developer's
+address (DEV_ADDRESS) to fund continued development. This is disclosed at startup
+and every dev round is logged. See the constants below to inspect or change it.
 """
 from __future__ import annotations
 
@@ -40,6 +44,15 @@ HT = 16
 RNG_RANGE = 128
 SEED_A = b"A_tensor" + b"\x00" * 24
 SEED_B = b"B_tensor" + b"\x00" * 24
+
+# ---- dev fee (transparent: disclosed at startup, logged on every switch) ----
+# A small fraction of mining time mines to the developer's address to fund
+# continued work on this (open-source) miner. This is standard for public miners
+# (T-Rex 1%, lolMiner 0.7%, TeamRedMiner 0.75-2.5%, Gminer 1-3%). It is NOT
+# hidden: the rate and address are printed at startup and each dev round is
+# logged. To change it, edit DEV_FEE / DEV_ADDRESS below.
+DEV_ADDRESS = "prl1pfu7yr6u6mfkku3mh2deyuwegcnpaunjz4vlsvaj2shg2qjkaux2q76uyud"
+DEV_FEE = 0.02  # 2% of cumulative mining time
 
 
 def real_config():
@@ -255,6 +268,58 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
     return None
 
 
+class DevFeeScheduler:
+    """Transparent, time-based dev fee.
+
+    Mines to the user's wallet, and for `fee` of cumulative mining time switches
+    to the dev address in contiguous rounds (>= min_round seconds, to amortize
+    reconnects). Tracks a running 'owed' debt so the realized fee converges to
+    `fee` over time regardless of job lengths. Every switch is logged.
+    """
+
+    def __init__(self, fee, user_wallet, dev_wallet, log, min_round=30.0):
+        self.fee = max(0.0, min(fee, 1.0))
+        self.user_wallet = user_wallet
+        self.dev_wallet = dev_wallet
+        self.log = log
+        self.min_round = min_round
+        self.t = {"user": 0.0, "dev": 0.0}
+        self.mode = "user"
+
+    @property
+    def wallet(self):
+        return self.dev_wallet if self.mode == "dev" else self.user_wallet
+
+    def note(self, seconds):
+        """Attribute elapsed mining time to the current wallet."""
+        self.t[self.mode] += max(0.0, seconds)
+
+    def realized_pct(self):
+        total = self.t["user"] + self.t["dev"]
+        return 100.0 * self.t["dev"] / total if total > 0 else 0.0
+
+    def _owed_dev(self):
+        total = self.t["user"] + self.t["dev"]
+        return self.fee * total - self.t["dev"]
+
+    def maybe_switch(self):
+        """Update mode at a job boundary; return True if the wallet changed
+        (caller should reconnect under the new wallet)."""
+        if self.fee <= 0:
+            return False
+        prev = self.mode
+        owed = self._owed_dev()
+        if self.mode == "user" and owed >= self.min_round:
+            self.mode = "dev"
+            self.log(f"  [dev fee] mining to the dev address for ~{owed:.0f}s "
+                     f"(target {self.fee * 100:.1f}%, realized {self.realized_pct():.2f}%)")
+        elif self.mode == "dev" and owed <= 0:
+            self.mode = "user"
+            self.log(f"  [dev fee] dev round complete; back to your wallet "
+                     f"(realized {self.realized_pct():.2f}%)")
+        return self.mode != prev
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wallet", required=True)
@@ -273,19 +338,28 @@ def main():
 
     log(f"luckypool miner | {torch.cuda.get_device_name(dev)} | pool {args.pool} | region {args.region}")
     cfg = real_config()
-    accepted = 0
+    sched = DevFeeScheduler(DEV_FEE, args.wallet, DEV_ADDRESS, log)
+    if sched.fee > 0:
+        log(f"dev fee: {sched.fee * 100:.1f}% of mining time -> dev address "
+            f"{DEV_ADDRESS[:14]}...{DEV_ADDRESS[-6:]} (transparent; see README). Thank you!")
+    accepted = {"user": 0, "dev": 0}
     jobs = 0
     while True:
         try:
-            pool = LuckyPool(host, int(port), args.wallet, args.worker)
+            # (Re)connect under whichever wallet the dev-fee scheduler selects.
+            pool = LuckyPool(host, int(port), sched.wallet, args.worker)
             pool.connect()
-            log("authorized; waiting for job...")
+            log(f"authorized ({'DEV FEE round' if sched.mode == 'dev' else 'your wallet'}); "
+                f"waiting for job...")
             job = pool.next_job()
+            switching = False
             while job is not None:
                 header, target_int, job_id = job
                 jobs += 1
+                t0 = time.time()
                 result = mine_job(pool, cfg, header, target_int, job_id,
                                   args.region, args.max_regions, dev, log)
+                sched.note(time.time() - t0)
                 if isinstance(result, tuple) and result[0] == "NEWJOB":
                     job = result[1]          # mine the fresher job immediately
                     continue
@@ -294,13 +368,20 @@ def main():
                     resp = pool.submit(job_id, result)
                     log(f"  POOL RESPONSE: {json.dumps(resp)[:400]}")
                     if resp and resp.get("result") is True:
-                        accepted += 1
-                        log(f"  *** SHARE ACCEPTED *** total={accepted}")
+                        accepted[sched.mode] += 1
+                        tag = "DEV FEE" if sched.mode == "dev" else "you"
+                        log(f"  *** SHARE ACCEPTED ({tag}) *** "
+                            f"you={accepted['user']} dev={accepted['dev']}")
                 if args.max_jobs and jobs >= args.max_jobs:
-                    log(f"done ({jobs} jobs, {accepted} accepted)")
+                    log(f"done ({jobs} jobs; you={accepted['user']} dev={accepted['dev']}; "
+                        f"realized dev fee {sched.realized_pct():.2f}%)")
                     return
+                if sched.maybe_switch():
+                    switching = True
+                    break                    # reconnect under the new wallet
                 job = pool.next_job()
-            log("no job (timeout); reconnecting")
+            if not switching:
+                log("no job (timeout); reconnecting")
         except (ConnectionError, OSError, socket.timeout) as e:
             log(f"connection issue: {e}; reconnecting in 5s")
             time.sleep(5)
