@@ -52,7 +52,7 @@ _lib.p40_transpose_i8.argtypes = [_VP, _VP, _I, _I, _I, _I]
 _lib.p40_noise_gen.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I, _I]
 _lib.p40_noise_apply_A.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I]
 _lib.p40_noise_apply_B.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I]
-_lib.p40_pearl_pow_split.argtypes = [_VP, _VP, _I, _I, _I, _I, _VP, _VP, _VP, _VP, _VP, _I]
+_lib.p40_pearl_pow_split.argtypes = [_VP, _VP, _I, _I, _I, _I, _VP, _VP, _VP, _VP, _VP, _VP, _I]
 
 
 def _chk(rc, what):
@@ -110,9 +110,13 @@ def noise_apply_B(B, EBR, EAR, EBL, BpEB, EARxBpEB, N, K, R):
                                 _as(BpEB), _as(EARxBpEB), N, K, R), "noise_B")
 
 
-def pearl_pow_split(A, Bt, m, n, k, R, key, target, digests, found, coord, variant):
+def pearl_pow_split(A, Bt, m, n, k, R, key, target, transcript, digests, found, coord, variant):
+    """transcript is a caller-owned reusable buffer (>= (m/16)*(n/16)*16 uint32).
+    digests may be 0/None to skip the per-tile digest write (mining only needs
+    found/coord)."""
     _chk(_lib.p40_pearl_pow_split(_as(A), _as(Bt), m, n, k, R, _as(key), _as(target),
-                                  _as(digests), _as(found), _as(coord), variant),
+                                  _as(transcript), _as(digests) or _VP(0), _as(found),
+                                  _as(coord), variant),
          "pearl_pow_split")
 
 

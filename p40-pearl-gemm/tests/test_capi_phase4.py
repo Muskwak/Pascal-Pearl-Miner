@@ -74,10 +74,11 @@ dBpEB, dEARx = cc.DBuf(N * K), cc.DBuf(N * R * 4)
 cc.noise_apply_B(dBt, dEBR, dEAR, dEBL, dBpEB, dEARx, N, K, R)
 
 num_tiles = (M // 16) * (N // 16)
+dtb = cc.DBuf(num_tiles * 16 * 4)
 ddig, dfound, dcoord = cc.DBuf(num_tiles * 32), cc.DBuf(4), cc.DBuf(8)
 dtgt = cc.DBuf(32); dtgt.memset(-1)         # 0xFF target
 dfound.memset(0)
-cc.pearl_pow_split(dApEA, dBpEB, M, N, K, R, dka, dtgt, ddig, dfound, dcoord, VAR)
+cc.pearl_pow_split(dApEA, dBpEB, M, N, K, R, dka, dtgt, dtb, ddig, dfound, dcoord, VAR)
 cc.sync()
 out = np.empty((num_tiles, 32), dtype=np.uint8)
 ddig.to_host(out)

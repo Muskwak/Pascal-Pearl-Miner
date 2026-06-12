@@ -100,22 +100,20 @@ P40_API int p40_noise_apply_B(const void* B, const void* EBR, const void* EAR,
   return (int)cudaGetLastError();
 }
 
-// Two-step search: GEMM-only -> transcript buffer (allocated internally) ->
-// BLAKE3. digests[(m/16)*(n/16), 32], found[1], coord[2] are caller-allocated.
+// Two-step search: GEMM-only -> transcript buffer -> BLAKE3. The caller provides
+// a reusable transcript buffer (>= (m/16)*(n/16)*16 uint32) so the mining hot
+// loop does NOT cudaMalloc/Free per region (that serializes the device). All of
+// transcript, digests[(m/16)*(n/16),32], found[1], coord[2] are caller-allocated.
 P40_API int p40_pearl_pow_split(const void* A, const void* Bt, int m, int n,
                                 int k, int R, const void* key, const void* target,
-                                void* digests, void* found, void* coord,
-                                int variant) {
+                                void* transcript, void* digests, void* found,
+                                void* coord, int variant) {
   const int num_tiles = (m / 16) * (n / 16);
-  uint32_t* tb = nullptr;
-  cudaError_t e = cudaMalloc((void**)&tb, (size_t)num_tiles * 16 * sizeof(uint32_t));
-  if (e != cudaSuccess) return (int)e;
+  uint32_t* tb = (uint32_t*)transcript;
   launch_pearl_gemm_only((const int8_t*)A, (const int8_t*)Bt, m, n, k, R, tb,
                          variant, 0);
   launch_pearl_blake3(tb, num_tiles, n, (const uint32_t*)key,
                       (const uint32_t*)target, (uint8_t*)digests, (int*)found,
                       (int*)coord, 0);
-  e = cudaGetLastError();
-  cudaFree(tb);
-  return (int)e;
+  return (int)cudaGetLastError();
 }

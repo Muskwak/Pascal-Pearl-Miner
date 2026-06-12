@@ -25,7 +25,7 @@ lib.p40_sync.argtypes = []
 lib.p40_pearl_pow_split.argtypes = (
     [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
      ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
 )
 
 
@@ -65,11 +65,12 @@ def run(m, n, k, R, seed):
 
     dA, dBt = dmalloc(An.nbytes), dmalloc(Btn.nbytes)
     dkey, dtgt = dmalloc(32), dmalloc(32)
+    dtb = dmalloc(num_tiles * 16 * 4)
     ddig, dfound, dcoord = dmalloc(num_tiles * 32), dmalloc(4), dmalloc(8)
     htod(dA, An); htod(dBt, Btn); htod(dkey, keyn); htod(dtgt, tgtn)
     lib.p40_memset(dfound, 0, 4); lib.p40_memset(dcoord, 255, 8)
 
-    r = lib.p40_pearl_pow_split(dA, dBt, m, n, k, R, dkey, dtgt, ddig, dfound, dcoord, 1)
+    r = lib.p40_pearl_pow_split(dA, dBt, m, n, k, R, dkey, dtgt, dtb, ddig, dfound, dcoord, 1)
     lib.p40_sync()
     assert r == 0, f"p40_pearl_pow_split returned {r}"
 

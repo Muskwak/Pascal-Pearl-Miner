@@ -44,9 +44,12 @@ class Bufs:
         self.dBt_tmp = cc.DBuf(RS * K)
         self.dEARx = cc.DBuf(RS * R * 4)
         ntiles = (RS // 16) ** 2
-        self.ddig = cc.DBuf(ntiles * 32)
+        self.dtb = cc.DBuf(ntiles * 16 * 4)   # reusable transcript buffer
         self.dfound = cc.DBuf(4)
         self.dcoord = cc.DBuf(8)
+        # Persistent per-column Bt_ns buffers (one per column block), reused every
+        # job — recomputed per job but never re-malloc'd.
+        self.dBpEB = [cc.DBuf(RS * K) for _ in range(N // RS)]
 
 
 def _rand_i8(rows, cols):
@@ -82,23 +85,19 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, 
     last_print = search_t0
     found = np.empty(1, np.int32)
     coord = np.empty(2, np.int32)
-    bt_cache: dict[int, cc.DBuf] = {}
-
-    def cleanup():
-        for b in bt_cache.values():
-            b.free()
+    computed: set[int] = set()  # which column blocks have Bt_ns ready this job
 
     def bt_noised(c0):
-        d = bt_cache.get(c0)
-        if d is None:
-            d = cc.DBuf(RS * K)
+        idx = c0 // RS
+        d = bufs.dBpEB[idx]
+        if idx not in computed:
             cc.transpose_i8(bufs.dB, bufs.dBt_tmp, K, RS, N, c0)  # B[:,c0:c0+RS].t()
             cc.noise_apply_B(bufs.dBt_tmp, bufs.dEBR.offset(c0 * R), bufs.dEAR,
                              bufs.dEBL, d, bufs.dEARx, RS, K, R)
-            bt_cache[c0] = d
+            computed.add(idx)
         return d
 
-    try:
+    if True:
         for r0 in range(0, M, RS):
             cc.noise_apply_A(bufs.dA.offset(r0 * K), bufs.dEAL.offset(r0 * R),
                              bufs.dEAR_t, bufs.dEBL_t, bufs.dApEA, bufs.dAxEBL, RS, K, R)
@@ -119,8 +118,10 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, 
 
                 dBpEB = bt_noised(c0)
                 bufs.dfound.memset(0)
+                # digests=None: mining only needs found/coord (skips the per-tile
+                # digest write); transcript is the reusable buffer (no per-region malloc).
                 cc.pearl_pow_split(bufs.dApEA, dBpEB, RS, RS, K, R, bufs.dka, bufs.dtgt,
-                                   bufs.ddig, bufs.dfound, bufs.dcoord, VARIANT)
+                                   bufs.dtb, None, bufs.dfound, bufs.dcoord, VARIANT)
                 cc.sync()
                 bufs.dfound.to_host(found)
                 if int(found[0]) != 1:
@@ -141,8 +142,6 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, 
         ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
         log(f"  {searched} regions searched ({ths:.2f} TH/s); no hit in this job")
         return None
-    finally:
-        cleanup()
 
 
 def main():
