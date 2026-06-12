@@ -34,3 +34,4 @@ p40cuda.dll
 libp40cuda.so
 *.exp
 *.lib
+releases/
