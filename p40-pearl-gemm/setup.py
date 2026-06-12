@@ -39,6 +39,7 @@ sources = [
     "csrc/gemm/bindings.cpp",
 
     # Pascal-specific kernels (DP4A-based)
+    "csrc/gemm/rng_fill_sm61.cu",
     "csrc/gemm/dp4a_gemm_sm61.cu",
     "csrc/gemm/noising_sm61.cu",
     "csrc/gemm/api_sm61.cu",

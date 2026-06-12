@@ -80,6 +80,16 @@ void tensor_hash(
     uint32_t num_stages, uint32_t leaves_per_mt_block, uint8_t* roots,
     cudaDeviceProp& deviceProp, cudaStream_t stream);
 
+// Commitment hash from merkle roots (definition in tensor_hash_host_sm61.hpp)
+void commitment_hash_from_merkle_roots(
+    const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
+    const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
+    cudaDeviceProp& deviceProp, cudaStream_t stream);
+
+// RNG fill + transpose (definition in rng_fill_sm61.cu, extern "C")
+extern "C" void launch_fill_rand_i8(int8_t* out, int64_t numel, uint64_t seed, cudaStream_t stream);
+extern "C" void launch_transpose_i8(const int8_t* src, int8_t* dst, int rows, int cols, cudaStream_t stream);
+
 namespace {
 
 inline cudaStream_t cur_stream() {
@@ -365,6 +375,92 @@ std::vector<at::Tensor> noise_gen(at::Tensor key_A, at::Tensor key_B,
   return {EAL, EAR, EBL, EBR};
 }
 
+// Fill int8 tensor(s) on GPU with random values in [-64, 63] using Philox RNG.
+// out: int8 tensor on CUDA — filled in-place.
+// seed: optional 64-bit seed (default 0 uses a hash of the current ns timestamp).
+void fill_rand_i8_py(at::Tensor out, c10::optional<int64_t> seed_opt) {
+  TORCH_CHECK(out.is_cuda(), "fill_rand_i8: tensor must be CUDA");
+  TORCH_CHECK(out.scalar_type() == at::kChar, "fill_rand_i8: tensor must be int8");
+  TORCH_CHECK(out.is_contiguous(), "fill_rand_i8: tensor must be contiguous");
+  const c10::cuda::CUDAGuard device_guard(out.device());
+  uint64_t seed = seed_opt.value_or(0xDEADBEEFCAFEBABEull);
+  launch_fill_rand_i8(out.data_ptr<int8_t>(), out.numel(), seed, cur_stream());
+}
+
+// Full GPU setup: generate A,B on device, compute commitment hashes, return
+// {A, B, noise_seed_A, noise_seed_B} as tensors.
+// key: 32-byte uint8 CUDA tensor (job key = BLAKE3(header||config))
+// M,N,K,R: matrix dims; seed: Philox seed.
+std::vector<at::Tensor> setup_job(at::Tensor key,
+                                  int64_t M, int64_t N, int64_t K, int64_t R,
+                                  int64_t seed) {
+  TORCH_CHECK(key.is_cuda() && key.scalar_type() == at::kByte && key.numel() == 32,
+              "setup_job: key must be 32-byte uint8 on CUDA");
+  const c10::cuda::CUDAGuard device_guard(key.device());
+  auto stream = cur_stream();
+  auto dprops = *at::cuda::getCurrentDeviceProperties();
+  auto dev = key.device();
+
+  auto i8 = at::TensorOptions().dtype(at::kChar).device(dev);
+  auto u8 = at::TensorOptions().dtype(at::kByte).device(dev);
+
+  // 1. Allocate and fill A [M,K], B [K,N]
+  auto A = at::empty({M, K}, i8);
+  auto B = at::empty({K, N}, i8);
+  launch_fill_rand_i8(A.data_ptr<int8_t>(), M * K, seed, stream);
+  launch_fill_rand_i8(B.data_ptr<int8_t>(), K * N, seed + 1, stream);
+
+  // 2. Transpose B → Bt [N,K] for B^T Merkle root
+  auto Bt = at::empty({N, K}, i8);
+  launch_transpose_i8(B.data_ptr<int8_t>(), Bt.data_ptr<int8_t>(), (int)K, (int)N, stream);
+
+  // 3. Tensor hash scratch sizing
+  constexpr uint32_t chunk_size = 1024u;
+  const uint32_t tpb = 128;
+  uint32_t num_chunks_A = (uint32_t)(M * K + chunk_size - 1) / chunk_size;
+  uint32_t num_blocks_A = (num_chunks_A + tpb - 1) / tpb;
+  uint32_t num_chunks_B = (uint32_t)(N * K + chunk_size - 1) / chunk_size;
+  uint32_t num_blocks_B = (num_chunks_B + tpb - 1) / tpb;
+  uint32_t scratch_bytes = std::max(num_blocks_A, num_blocks_B) * 32u;
+
+  // 4. Allocate Merkle root outputs + scratch
+  auto A_root = at::empty(32, u8);
+  auto B_root = at::empty(32, u8);
+  auto scratch = at::empty({(int64_t)scratch_bytes}, u8);
+
+  // 5. tensor_hash A → A_root
+  tensor_hash(
+      reinterpret_cast<const uint8_t*>(A.data_ptr<int8_t>()), (uint32_t)(M * K),
+      A_root.data_ptr<uint8_t>(), key.data_ptr<uint8_t>(),
+      num_blocks_A, tpb, 2, 512,
+      scratch.data_ptr<uint8_t>(), dprops, stream);
+
+  // 6. tensor_hash Bt → B_root
+  tensor_hash(
+      reinterpret_cast<const uint8_t*>(Bt.data_ptr<int8_t>()), (uint32_t)(N * K),
+      B_root.data_ptr<uint8_t>(), key.data_ptr<uint8_t>(),
+      num_blocks_B, tpb, 2, 512,
+      scratch.data_ptr<uint8_t>(), dprops, stream);
+
+  // 7. Commitment hash from merkle roots → noise seeds
+  auto noise_seed_A = at::empty(32, u8);
+  auto noise_seed_B = at::empty(32, u8);
+  commitment_hash_from_merkle_roots(
+      A_root.data_ptr<uint8_t>(), B_root.data_ptr<uint8_t>(),
+      key.data_ptr<uint8_t>(),
+      noise_seed_A.data_ptr<uint8_t>(), noise_seed_B.data_ptr<uint8_t>(),
+      dprops, stream);
+
+  return {A, B, noise_seed_A, noise_seed_B};
+}
+
+// Free Bt scratch allocated in setup_job (frees GPU memory eagerly).
+void free_tensor(at::Tensor t) {
+  // Force release by assigning empty. The tensor goes out of scope immediately.
+  at::Tensor empty;
+  t = empty;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Pascal (sm_61) Pearl GEMM CUDA kernels";
   m.def("dp4a_gemm", &dp4a_gemm, "INT8 DP4A GEMM (C = A @ B^T, dequantized)");
@@ -405,4 +501,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("roots"), pybind11::arg("threads_per_block") = 128,
         pybind11::arg("num_stages") = 2,
         pybind11::arg("leaves_per_mt_block") = 512);
+  m.def("fill_rand_i8", &fill_rand_i8_py,
+        "Fill int8 CUDA tensor with random values [-64,63] using Philox RNG",
+        pybind11::arg("out"), pybind11::arg("seed") = pybind11::none());
+  m.def("setup_job", &setup_job,
+        "Full GPU setup: RNG A,B → commit → noise seeds. Returns {A,B,noise_A,noise_B}",
+        pybind11::arg("key"), pybind11::arg("M"), pybind11::arg("N"),
+        pybind11::arg("K"), pybind11::arg("R"), pybind11::arg("seed") = 0);
 }

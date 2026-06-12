@@ -170,3 +170,17 @@ def tensor_hash(
         data, key, out, roots,
         threads_per_block, num_stages, leaves_per_mt_block,
     )
+
+
+def fill_rand_i8(out: torch.Tensor, seed: int | None = None):
+    _check_import()
+    _C.fill_rand_i8(out, seed)
+
+
+def setup_job(
+    key: torch.Tensor,
+    M: int, N: int, K: int, R: int,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _check_import()
+    return _C.setup_job(key, M, N, K, R, seed)

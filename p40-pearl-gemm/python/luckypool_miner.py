@@ -185,18 +185,17 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
     # job key = BLAKE3(header + config) — validated derivation
     key = miner.derive_key(header, cfg)
 
-    # full operands at the mandated dims; commit via the VALIDATED path
+    # full operands at the mandated dims; pure-GPU pipeline
+    # (Philox RNG → tensor_hash ×2 → commitment_hash, all on device)
     t0 = time.time()
-    A = torch.randint(-64, 63, (M, K), dtype=torch.int8, device=dev)   # [m,k]
-    B = torch.randint(-64, 63, (K, N), dtype=torch.int8, device=dev)   # [k,n]
-    a_seed, b_seed = miner.commitment_hashes(A, B, key)                # commits A and B^T
+    key_t = torch.frombuffer(bytearray(key), dtype=torch.uint8).to(dev)
+    A, B, noise_seed_A, noise_seed_B = miner._C.setup_job(
+        key_t, M, N, K, R, int(time.time() * 1e9))
     log(f"  committed A,B ({(time.time()-t0):.1f}s)")
 
     # GPU noise generation (all on-device; replaces the Python BLAKE3 path).
     # EAL[M,R], EAR[R,K], EBL[K,R], EBR[N,R] — bit-exact with generate_noise.
-    key_t = torch.frombuffer(bytearray(a_seed), dtype=torch.uint8).to(dev)
-    keyB_t = torch.frombuffer(bytearray(b_seed), dtype=torch.uint8).to(dev)
-    EAL, EAR, EBL, EBR = miner._C.noise_gen(key_t, keyB_t, M, N, K, R)
+    EAL, EAR, EBL, EBR = miner._C.noise_gen(noise_seed_A, noise_seed_B, M, N, K, R)
     E_BLt = EBL.t().contiguous()                                                  # [R,K]
 
     RS = region
@@ -246,7 +245,10 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
             # from the R=256 reduction window halves shared mem (~33KB->~17KB/block),
             # lifting occupancy from 2 blocks/SM (shared-bound) to 4 blocks/SM (100%
             # thread occupancy). ~7.25 TH/s, +21% over full-width S=256. Bit-exact.
-            _, found, coord = miner._C.pearl_pow_split(A_nc, Bt_ns, key_t, tgt_t, R, 1)
+            # pow_key MUST be noise_seed_A (== commitment_A), NOT the job key —
+            # the reference keys the final jackpot BLAKE3 with noise_seed_A, so
+            # using the job key here makes every "win" fail the pool's verifier.
+            _, found, coord = miner._C.pearl_pow_split(A_nc, Bt_ns, noise_seed_A, tgt_t, R, 1)
             torch.cuda.synchronize()
             if int(found[0]) != 1:
                 continue
