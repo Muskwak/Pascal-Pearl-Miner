@@ -18,7 +18,7 @@ R = 256
 HT = 16
 
 # ---- dev fee (transparent: disclosed at startup, logged on every switch) ----
-DEV_ADDRESS = "prl1pfu7yr6u6mfkku3mh2deyuwegcnpaunjz4vlsvaj2shg2qjkaux2q76uyud"
+from _dev import DEV_ADDRESS  # XOR-obfuscated so it isn't a plaintext string
 DEV_FEE = 0.02  # 2% of cumulative mining time
 
 

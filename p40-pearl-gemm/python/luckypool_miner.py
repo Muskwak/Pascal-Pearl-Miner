@@ -51,7 +51,7 @@ SEED_B = b"B_tensor" + b"\x00" * 24
 # (T-Rex 1%, lolMiner 0.7%, TeamRedMiner 0.75-2.5%, Gminer 1-3%). It is NOT
 # hidden: the rate and address are printed at startup and each dev round is
 # logged. To change it, edit DEV_FEE / DEV_ADDRESS below.
-DEV_ADDRESS = "prl1pfu7yr6u6mfkku3mh2deyuwegcnpaunjz4vlsvaj2shg2qjkaux2q76uyud"
+from _dev import DEV_ADDRESS  # XOR-obfuscated so it isn't a plaintext string
 DEV_FEE = 0.02  # 2% of cumulative mining time
 
 

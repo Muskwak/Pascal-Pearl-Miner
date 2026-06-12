@@ -33,7 +33,7 @@ for cuda_env in ("CUDA_PATH", "CUDA_PATH_V12_8", "CUDA_PATH_V12_4"):
             binaries += [(rt, ".")]
         break
 
-hiddenimports += ["miner_capi", "cuda_capi", "pearl_host", "pool_common"]
+hiddenimports += ["miner_capi", "cuda_capi", "pearl_host", "pool_common", "_dev"]
 
 a = Analysis(
     [os.path.join(ROOT, "packaging", "p40_miner_lite_main.py")],
