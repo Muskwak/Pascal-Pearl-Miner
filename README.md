@@ -9,6 +9,7 @@ NVIDIA driver and the standalone binary.
 ## Performance
 
 - **~7.0 TH/s** sustained on a single Tesla P40.
+- **Multi-GPU** — auto-detects every GPU and runs one worker per card, near-linear scaling.
 - **Continuous mining** — no idle time waiting between pool jobs.
 - **Background proof submission** — finding a share never stalls the search.
 
@@ -36,7 +37,27 @@ p40-miner.exe --wallet prl1YOURWALLET --worker rig1
 | `--wallet` | _(required)_                        | Your Pearl payout address         |
 | `--worker` | `p40`                               | Worker name shown on the pool     |
 | `--pool`   | `pearl-cpu-eu1.luckypool.io:3370`   | Stratum `host:port`               |
+| `--devices`| _(auto-detect all)_                 | GPUs to use, e.g. `0,1,2` or `all`|
 | `--region` | `4096`                              | Sub-output search size            |
+
+## Multi-GPU
+
+By default the miner **auto-detects every GPU** and runs one worker per card
+(worker names auto-suffixed `-gpu0`, `-gpu1`, …), with a combined-hashrate summary.
+Just run it normally on a rig — no flags needed:
+
+```
+p40-miner.exe --wallet prl1YOURWALLET --worker rig1
+```
+
+To select specific cards, use `--devices`:
+
+```
+p40-miner.exe --wallet prl1YOURWALLET --devices 0,2
+```
+
+Each GPU runs as an independent pinned process (with blocking-sync CUDA so the cards
+don't fight over CPU), giving near-linear scaling on 4–8 GPU rigs.
 
 ## Pool
 
