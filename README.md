@@ -32,7 +32,7 @@ Grab the latest from the
 |------|----------|
 | `p40-miner-windows-x64.zip`     | Windows x64 |
 | `p40-miner-linux-x64.tar.gz`    | Linux (Ubuntu 20.04 / 22.04 / 24.04, and other distros) |
-| `p40-miner-hiveos-1.2.0.tar.gz` | HiveOS custom miner |
+| `p40-miner-hiveos-1.2.1.tar.gz` | HiveOS custom miner |
 
 ## Usage (Windows / Linux)
 
@@ -56,15 +56,15 @@ tar xzf p40-miner-linux-x64.tar.gz
 | `--pool`   | `pearl-cpu-eu1.luckypool.io:3370`   | Stratum `host:port`               |
 | `--devices`| _(auto-detect all)_                 | GPUs to use, e.g. `0,1,2` or `all`|
 | `--region` | `4096`                              | Sub-output search size            |
-| `--solo`   | _(off)_                             | Solo mine to a local pearl-gateway `HOST:PORT` (no pool/wallet/dev fee) |
+| `--solo`   | _(off)_                             | Solo mine to a local pearl-gateway `HOST:PORT` (rewards → your node) |
 
 ## HiveOS
 
-Download `p40-miner-hiveos-1.2.0.tar.gz` and install it as a **Custom** miner:
+Download `p40-miner-hiveos-1.2.1.tar.gz` and install it as a **Custom** miner:
 
 1. **Flight Sheet → Miner = Custom.**
 2. Set the **Installation URL** to the tarball, *or* `scp` it to the rig and run
-   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.2.0.tar.gz`.
+   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.2.1.tar.gz`.
 3. **Wallet and worker:** your Pearl wallet `prl1...` (worker name auto-appended).
 4. **Pool URL:** `pearl-cpu-eu1.luckypool.io:3370` (default LuckyPool).
 5. **Extra config arguments** (optional): `--devices 0,1`, `--region 4096`, etc.
@@ -92,8 +92,9 @@ LuckyPool region or port. Currently only LuckyPool's stratum protocol is support
 
 A transparent **2%** dev fee is included: for 2% of cumulative mining time the miner
 mines to the developer's address. This is disclosed at startup and logged on every
-switch, so you can always see exactly when it is active. (Solo mode via `--solo` has
-no dev fee — block rewards go to your node's configured address.)
+switch, so you can always see exactly when it is active. This applies in **`--solo`
+mode too** — for those 2% the GPU mines to the dev's pool wallet instead of your node;
+the rest of the time solo block rewards go to your node's configured address.
 
 Thank you for supporting development!
 
