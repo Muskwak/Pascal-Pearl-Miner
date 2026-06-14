@@ -3,15 +3,13 @@
 A high-performance **Pearl (PRL)** proof-of-work miner for **NVIDIA Pascal GPUs** —
 Tesla P40, GTX 1070 / 1080 (and other `sm_61`, DP4A-capable cards).
 
-<<<<<<< HEAD
-No Python, CUDA toolkit, or PyTorch required — the CUDA runtime is bundled. Just an
-NVIDIA driver and the standalone binary. **Windows, Linux, and HiveOS** builds are available.
-=======
-No Python, CUDA toolkit, or PyTorch required to **run** — the CUDA runtime is bundled
+No Python, CUDA toolkit, or PyTorch required **to run** — the CUDA runtime is bundled
 in pre-built releases. Just an NVIDIA driver and the standalone binary.
->>>>>>> a836de3 (Open-source v1.3.0: full source release (MIT))
-
 **Source is open (MIT)** — build it yourself or grab a pre-built release.
+
+> Mixed-GPU rigs are supported: native code is compiled for Pascal/Turing/Ampere/Ada
+> (`sm_61/75/86/89`) plus a PTX fallback that JIT-loads on any newer NVIDIA card.
+> Pascal is the optimized target; newer cards run functionally via the DP4A path.
 
 ## Features
 
@@ -25,17 +23,7 @@ in pre-built releases. Just an NVIDIA driver and the standalone binary.
 
 ## Pre-built Releases
 
-<<<<<<< HEAD
-- An NVIDIA Pascal GPU (Tesla P40, GTX 1070/1080, or other `sm_61`)
-- An up-to-date NVIDIA driver (the CUDA runtime is bundled — no CUDA install needed)
-- **Windows x64**, **Linux x86-64** (Ubuntu 20.04 / 22.04 / 24.04, glibc ≥ 2.30), or **HiveOS**
-
-> Mixed-GPU rigs are supported: native code is compiled for Pascal/Turing/Ampere/Ada
-> (`sm_61/75/86/89`) plus a PTX fallback that JIT-loads on any newer NVIDIA card.
-> Pascal is the optimized target; newer cards run functionally via the DP4A path.
-=======
 Grab the latest binary from the [Releases](https://github.com/Muskwak/Pascal-Pearl-Miner/releases) page:
->>>>>>> a836de3 (Open-source v1.3.0: full source release (MIT))
 
 | File | Platform |
 |------|----------|
@@ -43,10 +31,9 @@ Grab the latest binary from the [Releases](https://github.com/Muskwak/Pascal-Pea
 | `p40-miner-linux-x64.tar.gz` | Linux (glibc >= 2.31) |
 | `p40-miner-hiveos-<ver>.tar.gz` | HiveOS custom miner |
 
-<<<<<<< HEAD
-Grab the latest from the
-[Releases](https://github.com/Muskwak/Pascal-Pearl-Miner/releases) page:
-=======
+**Requirements:** an NVIDIA Pascal GPU (Tesla P40, GTX 1070/1080, or other `sm_61`), an
+up-to-date NVIDIA driver, and **Windows x64**, **Linux x86-64** (glibc >= 2.31), or **HiveOS**.
+
 ### Quick Start
 
 ```bat
@@ -139,54 +126,11 @@ Upload to a URL or `scp` to the rig, then add as a Custom miner in HiveOS.
 pip install -e .   # editable install of the torch-based extension
 CUTLASS_DIR=... python -c "import p40_pearl_gemm"  # smoke test
 ```
->>>>>>> a836de3 (Open-source v1.3.0: full source release (MIT))
 
-| File | Platform |
-|------|----------|
-| `p40-miner-windows-x64.zip`     | Windows x64 |
-| `p40-miner-linux-x64.tar.gz`    | Linux (Ubuntu 20.04 / 22.04 / 24.04, and other distros) |
-| `p40-miner-hiveos-1.2.1.tar.gz` | HiveOS custom miner |
-
-## Usage (Windows / Linux)
-
-Windows:
-```
-p40-miner --wallet prl1YOURWALLET --worker rig1
-```
-
-Linux:
-```
-tar xzf p40-miner-linux-x64.tar.gz
-./p40-miner-linux-x64/p40-miner --wallet prl1YOURWALLET --worker rig1
-```
+## Usage
 
 ### Options
 
-<<<<<<< HEAD
-| Flag       | Default                             | Description                       |
-|------------|-------------------------------------|-----------------------------------|
-| `--wallet` | _(required)_                        | Your Pearl payout address         |
-| `--worker` | `p40`                               | Worker name shown on the pool     |
-| `--pool`   | `pearl-cpu-eu1.luckypool.io:3370`   | Stratum `host:port`               |
-| `--devices`| _(auto-detect all)_                 | GPUs to use, e.g. `0,1,2` or `all`|
-| `--region` | `4096`                              | Sub-output search size            |
-| `--solo`   | _(off)_                             | Solo mine to a local pearl-gateway `HOST:PORT` (rewards → your node) |
-
-## HiveOS
-
-Download `p40-miner-hiveos-1.2.1.tar.gz` and install it as a **Custom** miner:
-
-1. **Flight Sheet → Miner = Custom.**
-2. Set the **Installation URL** to the tarball, *or* `scp` it to the rig and run
-   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.2.1.tar.gz`.
-3. **Wallet and worker:** your Pearl wallet `prl1...` (worker name auto-appended).
-4. **Pool URL:** `pearl-cpu-eu1.luckypool.io:3370` (default LuckyPool).
-5. **Extra config arguments** (optional): `--devices 0,1`, `--region 4096`, etc.
-
-The miner reports per-GPU TH/s and accepted shares to the HiveOS dashboard.
-Built against glibc 2.31, so it runs on both the *focal* (20.04) and *jammy* (22.04)
-HiveOS images and newer.
-=======
 | Flag | Default | Description |
 |---|---|---|
 | `--wallet` | _(required)_ | Your Pearl payout address |
@@ -195,26 +139,12 @@ HiveOS images and newer.
 | `--devices` | _(auto-detect all)_ | GPU selection, e.g. `0,1,2` or `all` |
 | `--region` | `4096` | Sub-output search size |
 | `--solo` | _(off)_ | Solo mine to local pearl-gateway `HOST:PORT` |
->>>>>>> a836de3 (Open-source v1.3.0: full source release (MIT))
 
 ### Multi-GPU
 
-<<<<<<< HEAD
-By default the miner **auto-detects every GPU** and runs one worker per card
-(worker names auto-suffixed `-gpu0`, `-gpu1`, …), with a combined-hashrate summary.
-Just run it normally on a rig — no flags needed. To select specific cards, use
-`--devices 0,2`. Each GPU runs as an independent pinned process (with blocking-sync
-CUDA so the cards don't fight over CPU), giving near-linear scaling on 4–8 GPU rigs.
-
-## Pool
-
-Built for **LuckyPool**'s Pearl stratum. By default the miner connects to
-`pearl-cpu-eu1.luckypool.io:3370`. Use `--pool HOST:PORT` to select another
-LuckyPool region or port. Currently only LuckyPool's stratum protocol is supported.
-**Support for additional pools will be added in the next update.**
-=======
 Auto-detects every GPU and runs one worker per card (workers named `<worker>-gpu0`,
-`-gpu1`, ...) with a combined-hashrate summary. Just run it:
+`-gpu1`, ...) with a combined-hashrate summary. Each GPU runs as an independent pinned
+process with blocking-sync CUDA, giving near-linear scaling on 4–8 GPU rigs. Just run it:
 
 ```
 p40-miner.exe --wallet prl1YOURWALLET
@@ -226,7 +156,7 @@ Use `--devices` to select specific cards:
 p40-miner.exe --wallet prl1YOURWALLET --devices 0,2
 ```
 
-### Pool
+### Pool Mining
 
 Default: `pearl-cpu-eu1.luckypool.io:3370` (LuckyPool). Override with `--pool`:
 
@@ -244,20 +174,29 @@ p40-miner.exe --solo GATEWAY_HOST:PORT
 
 No wallet flag needed — the node's configured address receives block rewards.
 The same 2% dev fee applies (GPU mines to the dev's pool wallet during the 2% window).
->>>>>>> a836de3 (Open-source v1.3.0: full source release (MIT))
+
+## HiveOS
+
+Download `p40-miner-hiveos-1.2.1.tar.gz` and install it as a **Custom** miner:
+
+1. **Flight Sheet → Miner = Custom.**
+2. Set the **Installation URL** to the tarball, *or* `scp` it to the rig and run
+   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.2.1.tar.gz`.
+3. **Wallet and worker:** your Pearl wallet `prl1...` (worker name auto-appended).
+4. **Pool URL:** `pearl-cpu-eu1.luckypool.io:3370` (default LuckyPool).
+5. **Extra config arguments** (optional): `--devices 0,1`, `--region 4096`, etc.
+
+The miner reports per-GPU TH/s and accepted shares to the HiveOS dashboard.
+Built against glibc 2.31, so it runs on both the *focal* (20.04) and *jammy* (22.04)
+HiveOS images and newer.
 
 ## Dev Fee
 
 A transparent **2%** dev fee is included: for 2% of cumulative mining time the miner
 mines to the developer's address. This is disclosed at startup and logged on every
-<<<<<<< HEAD
-switch, so you can always see exactly when it is active. This applies in **`--solo`
-mode too** — for those 2% the GPU mines to the dev's pool wallet instead of your node;
-the rest of the time solo block rewards go to your node's configured address.
-=======
 switch, so you can always see exactly when it is active. The 2% applies to both pool
-and solo mining.
->>>>>>> a836de3 (Open-source v1.3.0: full source release (MIT))
+and solo mining — in solo mode the GPU mines to the dev's pool wallet during the 2%
+window; the rest of the time solo block rewards go to your node's configured address.
 
 Thank you for supporting development!
 
