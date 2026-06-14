@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Build artifacts
+build/
+build_pyi/
+dist/
+*.pyd
+*.dll
+*.so
+*.lib
+*.exp
+*.libp40cuda.so
+p40cuda.dll
+p40cuda.lib
+p40cuda.exp
+libp40cuda.so
+p40_pearl_gemm_cuda.cp313-win_amd64.pyd
+
+# Test logs
+*.log
+*.err
+*.out
+
+# Release tarballs (keep source, not prebuilt archives)
+releases/*.tar.gz
+releases/*.zip
+releases/*.whl
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
