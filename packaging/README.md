@@ -50,8 +50,8 @@ toolkit from NVIDIA and ensure `nvcc` and `cudart` are on PATH.
   is bundled; the kernel driver is not).
 - **GPU**: the extension is compiled for `sm_61` only (Pascal). Build with
   `ADDITIONAL_ARCHS=sm_70,sm_75,...` before freezing for broader GPU support.
-- **Dev fee**: the 2% dev fee is compiled into the binary. Because the source is
-  shipped (MIT), users can remove it — please don't; it's how development is funded.
-  The XOR-obfuscated address in `_dev.py` provides defense-in-depth for the
-  pre-built binaries against casual `strings` inspection.
+- **Dev fee**: the 2% dev fee is compiled into the binary. The license requires
+  the dev fee be retained in any distributed or commercial deployment; personal-use
+  exemption applies (see LICENSE). The XOR-obfuscated address in `_dev.py` provides
+  defense-in-depth for the pre-built binaries against casual `strings` inspection.
 - **Python version**: the bundle is tied to the Python that built it (cp313 here).
