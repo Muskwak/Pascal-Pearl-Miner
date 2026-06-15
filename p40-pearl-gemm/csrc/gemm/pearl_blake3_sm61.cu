@@ -13,10 +13,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-#include <cute/tensor.hpp>
 #include "blake3/blake3.cuh"
-
-using namespace cute;
 
 static constexpr int HT_B3 = 16;
 static constexpr int TRANSCRIPT_U32_B3 = 16;

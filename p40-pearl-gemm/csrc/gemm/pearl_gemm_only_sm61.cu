@@ -17,11 +17,6 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-#include <cute/tensor.hpp>
-#include "blake3/blake3.cuh"
-
-using namespace cute;
-
 static __device__ __forceinline__ int dp4a_go(int a, int b, int c) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
   // Use the intrinsic, NOT inline `asm volatile`: volatile is a scheduling
