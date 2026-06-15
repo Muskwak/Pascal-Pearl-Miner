@@ -28,7 +28,6 @@ def real_config():
     return pm.MiningConfiguration(
         common_dim=K, rank=R, mma_type=pm.MMAType.Int7xInt7ToInt32,
         rows_pattern=p, cols_pattern=pm.PeriodicPattern.from_list(list(range(HT))),
-        reserved=pm.MiningConfiguration.RESERVED,
     )
 
 

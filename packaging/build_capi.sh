@@ -6,19 +6,22 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-: "${CUTLASS_DIR:=C:/Users/ADMIN/audits/aphrodite-engine/.deps/cutlass-src/include}"
+: "${CUTLASS_DIR:="$(pwd)/.deps/cutlass/include"}"
 NVCC="${NVCC:-nvcc}"
 
-# Default arch: native Pascal SASS + a compute_61 PTX fallback so the library
-# JIT-loads on ANY newer NVIDIA card too (mixed rigs). DP4A lives in this PTX,
-# so every sm_61+ card runs the same kernel. Override GENCODE to add native
-# SASS for specific newer arches (avoids first-run JIT), e.g.:
-#   GENCODE="-gencode arch=compute_61,code=sm_61 \
-#            -gencode arch=compute_75,code=sm_75 \
-#            -gencode arch=compute_86,code=sm_86 \
+# Default arch: Pascal (sm_61) + Ampere (sm_80, sm_86) + Ada (sm_89).
+# The DP4A kernels run on sm_61, tensor-core kernels on sm_80+.
+# Pascal DP4A lives in sm_61 SASS; Ampere+ MMA/cp.async lives in sm_80+ SASS.
+# Override GENCODE to add/remove arches, e.g. for a pure-Ampere farm:
+#   GENCODE="-gencode arch=compute_86,code=sm_86 \
 #            -gencode arch=compute_89,code=sm_89 \
-#            -gencode arch=compute_61,code=compute_61"
-GENCODE="${GENCODE:-"-gencode arch=compute_61,code=sm_61 -gencode arch=compute_61,code=compute_61"}"
+#            -gencode arch=compute_86,code=compute_86"
+if [ -z "${GENCODE:-}" ]; then
+  GENCODE="-gencode arch=compute_61,code=sm_61 \
+           -gencode arch=compute_80,code=sm_80 \
+           -gencode arch=compute_86,code=sm_86 \
+           -gencode arch=compute_89,code=sm_89"
+fi
 
 case "$(uname -s)" in
   *NT*|*MINGW*|*MSYS*) OUT="p40cuda.dll"; CUDART_FLAG="" ;;
@@ -36,6 +39,7 @@ SRC=(
   csrc/gemm/rng_fill_sm61.cu
   csrc/tensor_hash/tensor_hash.cu
   csrc/gemm/noise_gemm_sm61.cu
+  csrc/gemm/pearl_ampere_tc.cu
 )
 
 # -Xcompiler -fPIC is required for a Linux shared library; -allow-unsupported-

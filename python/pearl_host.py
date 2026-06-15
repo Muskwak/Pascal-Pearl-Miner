@@ -45,14 +45,11 @@ def build_proof(A: np.ndarray, B: np.ndarray, winning_row: int, winning_col: int
     li_B = pm.MerkleTree.compute_leaf_indices_from_rows(b_cols, (n, k))
     mp_A = pm.MatrixMerkleProof(tree_A.get_multileaf_proof(li_A), a_rows)
     mp_B = pm.MatrixMerkleProof(tree_B.get_multileaf_proof(li_B), b_cols)
-    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B)
+    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B, None)
 
 
 def build_proof_bt(A: np.ndarray, Bt: np.ndarray, winning_row: int, winning_col: int,
                    key: bytes, noise_rank: int):
-    """Same as build_proof but takes B^T directly (already [n,k]) instead of B,
-    avoiding a 512 MB host transpose -- B^T was already produced on the GPU during
-    setup_job, so the caller snapshots that. Bit-identical proof to build_proof."""
     m, k = A.shape
     n = Bt.shape[0]
     TILE = 16
@@ -64,7 +61,7 @@ def build_proof_bt(A: np.ndarray, Bt: np.ndarray, winning_row: int, winning_col:
     li_B = pm.MerkleTree.compute_leaf_indices_from_rows(b_cols, (n, k))
     mp_A = pm.MatrixMerkleProof(tree_A.get_multileaf_proof(li_A), a_rows)
     mp_B = pm.MatrixMerkleProof(tree_B.get_multileaf_proof(li_B), b_cols)
-    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B)
+    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B, None)
 
 
 def derive_key(header_bytes: bytes, mining_config) -> bytes:
