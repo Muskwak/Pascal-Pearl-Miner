@@ -1,4 +1,7 @@
-// Torch-free C ABI over the Pascal Pearl kernels.
+// Torch-free C ABI over the Pascal (sm_61) and Ampere+ (sm_80+) Pearl kernels.
+//
+// Auto-detects GPU architecture and dispatches to DP4A (Pascal) or tensor-core
+// (Ampere/Ada) kernel. Multi-GPU: each device uses its optimal kernel path.
 //
 // Compiles to a standalone shared library (p40cuda.dll / libp40cuda.so) that
 // links ONLY the CUDA runtime (cudart, ~0.5 MB) — no torch, no pybind. Callers
@@ -36,6 +39,10 @@ void launch_pearl_gemm_only(const int8_t*, const int8_t*, int, int, int, int,
                             uint32_t*, int, cudaStream_t);
 void launch_pearl_blake3(const uint32_t*, int, int, const uint32_t*,
                          const uint32_t*, uint8_t*, int*, int*, cudaStream_t);
+
+// Ampere+ tensor-core GEMM+transcript kernel (definition in pearl_ampere_tc.cu).
+cudaError_t launch_pearl_ampere(const int8_t*, const int8_t*, int, int, int, int,
+                                uint32_t*, cudaStream_t);
 
 // =========================== transpose =====================================
 // Logical src is [rows, cols] with src[r,c] = src_base[r*src_ld + col_off + c]
@@ -158,14 +165,33 @@ P40_API int p40_noise_gemm(const void* X, const void* Y, const void* Z, void* ou
 // a reusable transcript buffer (>= (m/16)*(n/16)*16 uint32) so the mining hot
 // loop does NOT cudaMalloc/Free per region (that serializes the device). All of
 // transcript, digests[(m/16)*(n/16),32], found[1], coord[2] are caller-allocated.
+//
+// Auto-detects GPU architecture:
+//   sm_80+ (Ampere/Ada): tensor-core kernel (launch_pearl_ampere) + BLAKE3
+//   pre-sm_80 (Pascal/Volta): DP4A kernel (launch_pearl_gemm_only) + BLAKE3
 P40_API int p40_pearl_pow_split(const void* A, const void* Bt, int m, int n,
                                 int k, int R, const void* key, const void* target,
                                 void* transcript, void* digests, void* found,
                                 void* coord, int variant) {
+  cudaDeviceProp prop;
+  int dev = 0;
+  cudaGetDevice(&dev);
+  cudaGetDeviceProperties(&prop, dev);
+
   const int num_tiles = (m / 16) * (n / 16);
   uint32_t* tb = (uint32_t*)transcript;
-  launch_pearl_gemm_only((const int8_t*)A, (const int8_t*)Bt, m, n, k, R, tb,
-                         variant, 0);
+
+  if (prop.major >= 8) {
+    // Ampere+ tensor-core path
+    cudaError_t err = launch_pearl_ampere(
+        (const int8_t*)A, (const int8_t*)Bt, m, n, k, R, tb, 0);
+    if (err != cudaSuccess) return (int)err;
+  } else {
+    // Pascal DP4A path
+    launch_pearl_gemm_only((const int8_t*)A, (const int8_t*)Bt, m, n, k, R, tb,
+                           variant, 0);
+  }
+
   launch_pearl_blake3(tb, num_tiles, n, (const uint32_t*)key,
                       (const uint32_t*)target, (uint8_t*)digests, (int*)found,
                       (int*)coord, 0);

@@ -1,4 +1,7 @@
-// Python bindings for the Pascal (sm_61) Pearl GEMM kernels.
+// Python bindings for the Pascal (sm_61) and Ampere+ (sm_80+) Pearl GEMM kernels.
+//
+// Auto-detects GPU architecture and dispatches to DP4A (Pascal) or tensor-core
+// (Ampere/Ada) kernel. Multi-GPU: each device uses its optimal kernel path.
 //
 // Registers the C++/CUDA launchers as functions on the `p40_pearl_gemm_cuda`
 // extension module so they are callable from `p40_gemm_bindings.py`.
@@ -72,6 +75,13 @@ void launch_pearl_blake3(
     const uint32_t* pow_key, const uint32_t* pow_target,
     uint8_t* out_digests, int* found_flag, int* found_coord,
     cudaStream_t stream);
+
+// Ampere+ tensor-core GEMM+transcript kernel (definition in pearl_ampere_tc.cu).
+// Produces transcript buffer identical format to launch_pearl_gemm_only.
+// Returns cudaError_t (cudaSuccess on success, cudaErrorNotSupported on pre-sm_80).
+cudaError_t launch_pearl_ampere(
+    const int8_t* A, const int8_t* Bt, int m, int n, int k, int R,
+    uint32_t* transcript_buffer, cudaStream_t stream);
 
 // tensor_hash host entry (definition in tensor_hash.cu -> tensor_hash_host_sm61.hpp)
 void tensor_hash(
@@ -209,6 +219,10 @@ void tensor_hash_py(at::Tensor data, at::Tensor key, at::Tensor out,
 // Returns {digests[num_tiles,32] uint8, found[1] int32, coord[2] int32}.
 // A: [m,k] int8 noised; Bt: [n,k] int8 noised (B transposed). pow_key/pow_target:
 // 32-byte uint8 tensors (pow_target little-endian uint256).
+//
+// Auto-detects GPU architecture:
+//   sm_80+ (Ampere/Ada): tensor-core kernel (launch_pearl_ampere) + BLAKE3
+//   pre-sm_80 (Pascal/Volta): DP4A kernel (launch_pearl_pow)
 std::vector<at::Tensor> pearl_pow(at::Tensor A, at::Tensor Bt,
                                   at::Tensor pow_key, at::Tensor pow_target,
                                   int64_t R) {
@@ -220,11 +234,11 @@ std::vector<at::Tensor> pearl_pow(at::Tensor A, at::Tensor Bt,
               "pearl_pow: pow_key/pow_target must be 32 bytes");
   const int m = (int)A.size(0), k = (int)A.size(1), n = (int)Bt.size(0);
   TORCH_CHECK(Bt.size(1) == k, "pearl_pow: A[k] must match Bt[k]");
-  TORCH_CHECK(m % 16 == 0 && n % 16 == 0 && k % R == 0,
-              "pearl_pow: require m%16==0, n%16==0, k%R==0");
   TORCH_CHECK(R == 256 || R == 128 || R == 64, "pearl_pow: R must be 64, 128, or 256");
 
   const c10::cuda::CUDAGuard device_guard(A.device());
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+
   const int num_tiles = (m / 16) * (n / 16);
   auto u8 = at::TensorOptions().dtype(at::kByte).device(A.device());
   auto i32 = at::TensorOptions().dtype(at::kInt).device(A.device());
@@ -232,12 +246,35 @@ std::vector<at::Tensor> pearl_pow(at::Tensor A, at::Tensor Bt,
   auto found = at::zeros({1}, i32);
   auto coord = at::full({2}, -1, i32);
 
-  launch_pearl_pow(
-      A.data_ptr<int8_t>(), Bt.data_ptr<int8_t>(), m, n, k, (int)R,
-      reinterpret_cast<const uint32_t*>(pow_key.data_ptr()),
-      reinterpret_cast<const uint32_t*>(pow_target.data_ptr()),
-      digests.data_ptr<uint8_t>(), found.data_ptr<int>(), coord.data_ptr<int>(),
-      cur_stream());
+  if (dprops->major >= 8) {
+    // Ampere+ tensor-core path
+    TORCH_CHECK(m % 64 == 0 && n % 64 == 0 && k % R == 0,
+                "pearl_pow (Ampere): require m%64==0, n%64==0, k%R==0");
+    auto transcript_buffer = at::zeros({num_tiles, 16}, i32);
+    cudaError_t err = launch_pearl_ampere(
+        A.data_ptr<int8_t>(), Bt.data_ptr<int8_t>(), m, n, k, (int)R,
+        reinterpret_cast<uint32_t*>(transcript_buffer.data_ptr()),
+        cur_stream());
+    TORCH_CHECK(err == cudaSuccess, "pearl_pow (Ampere): kernel launch failed: ",
+                cudaGetErrorString(err));
+    launch_pearl_blake3(
+        reinterpret_cast<const uint32_t*>(transcript_buffer.data_ptr()),
+        num_tiles, n,
+        reinterpret_cast<const uint32_t*>(pow_key.data_ptr()),
+        reinterpret_cast<const uint32_t*>(pow_target.data_ptr()),
+        digests.data_ptr<uint8_t>(), found.data_ptr<int>(),
+        coord.data_ptr<int>(), cur_stream());
+  } else {
+    // Pascal DP4A path
+    TORCH_CHECK(m % 16 == 0 && n % 16 == 0 && k % R == 0,
+                "pearl_pow (Pascal): require m%16==0, n%16==0, k%R==0");
+    launch_pearl_pow(
+        A.data_ptr<int8_t>(), Bt.data_ptr<int8_t>(), m, n, k, (int)R,
+        reinterpret_cast<const uint32_t*>(pow_key.data_ptr()),
+        reinterpret_cast<const uint32_t*>(pow_target.data_ptr()),
+        digests.data_ptr<uint8_t>(), found.data_ptr<int>(), coord.data_ptr<int>(),
+        cur_stream());
+  }
   return {digests, found, coord};
 }
 
@@ -462,7 +499,7 @@ void free_tensor(at::Tensor t) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.doc() = "Pascal (sm_61) Pearl GEMM CUDA kernels";
+  m.doc() = "Pascal (sm_61) + Ampere (sm_80+) Pearl GEMM CUDA kernels; auto-selects DP4A or tensor-core";
   m.def("dp4a_gemm", &dp4a_gemm, "INT8 DP4A GEMM (C = A @ B^T, dequantized)");
   m.def("noise_A", &noise_A, "Pearl noise A kernel");
   m.def("noise_gen", &noise_gen,

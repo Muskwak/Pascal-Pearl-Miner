@@ -45,7 +45,24 @@ def build_proof(A: np.ndarray, B: np.ndarray, winning_row: int, winning_col: int
     li_B = pm.MerkleTree.compute_leaf_indices_from_rows(b_cols, (n, k))
     mp_A = pm.MatrixMerkleProof(tree_A.get_multileaf_proof(li_A), a_rows)
     mp_B = pm.MatrixMerkleProof(tree_B.get_multileaf_proof(li_B), b_cols)
-    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B)
+    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B, None)
+
+
+def build_proof_bt(A: np.ndarray, Bt: np.ndarray, winning_row: int, winning_col: int,
+                   key: bytes, noise_rank: int):
+    m, k = A.shape
+    n = Bt.shape[0]
+    TILE = 16
+    a_rows = list(range(winning_row, min(winning_row + TILE, m)))
+    b_cols = list(range(winning_col, min(winning_col + TILE, n)))
+    tree_A = _merkle_tree(A, key)
+    tree_B = _merkle_tree(Bt, key)
+    li_A = pm.MerkleTree.compute_leaf_indices_from_rows(a_rows, (m, k))
+    li_B = pm.MerkleTree.compute_leaf_indices_from_rows(b_cols, (n, k))
+    mp_A = pm.MatrixMerkleProof(tree_A.get_multileaf_proof(li_A), a_rows)
+    mp_B = pm.MatrixMerkleProof(tree_B.get_multileaf_proof(li_B), b_cols)
+    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B, None)
+
 
 
 def derive_key(header_bytes: bytes, mining_config) -> bytes:
