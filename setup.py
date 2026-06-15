@@ -25,7 +25,12 @@ COMPUTE_CAP = f"arch=compute_{cc},code={TARGET_ARCH}"
 ADDITIONAL_ARCHS = os.environ.get("ADDITIONAL_ARCHS", "")
 
 _GENCODE_FLAGS = []
-for a in [TARGET_ARCH] + [a.strip() for a in ADDITIONAL_ARCHS.split(",") if a.strip()]:
+_GENCODE_ARCHS = [TARGET_ARCH] + [a.strip() for a in ADDITIONAL_ARCHS.split(",") if a.strip()]
+# Always include sm_80+ for the Ampere tensor-core kernel
+for sm in ("sm_80", "sm_86", "sm_89"):
+    if sm not in _GENCODE_ARCHS:
+        _GENCODE_ARCHS.append(sm)
+for a in _GENCODE_ARCHS:
     if a.startswith("sm_"):
         cc = a.split("_")[1]
     else:
@@ -47,6 +52,9 @@ sources = [
     "csrc/gemm/pearl_pow_fused_sm61.cu",
     "csrc/gemm/pearl_gemm_only_sm61.cu",
     "csrc/gemm/pearl_blake3_sm61.cu",
+
+    # Ampere+ tensor-core kernel (sm_80+ PTX, guarded by __CUDA_ARCH__ >= 800)
+    "csrc/gemm/pearl_ampere_tc.cu",
 
     # Architecture-independent kernels from upstream pearl-gemm
     "csrc/blake3/blake3.cu",
@@ -110,9 +118,15 @@ if not cutlass_dir:
             break
 if not cutlass_dir:
     # Fallback for this dev machine
-    _DEFAULT_CUTLASS = r"C:\Users\ADMIN\audits\aphrodite-engine\.deps\cutlass-src\include"
-    if Path(_DEFAULT_CUTLASS).exists():
-        cutlass_dir = _DEFAULT_CUTLASS
+    _CANDIDATES = [
+        r"C:\Users\ADMIN\audits\aphrodite-engine\.deps\cutlass-src\include",
+        str(Path.cwd() / ".deps" / "cutlass" / "include"),
+        str(Path.cwd() / ".." / "cutlass" / "include"),
+    ]
+    for _p in _CANDIDATES:
+        if Path(_p).exists():
+            cutlass_dir = _p
+            break
 if not cutlass_dir:
     print(
         "WARNING: CUTLASS headers not found. "
