@@ -1,7 +1,7 @@
-# Pascal Pearl Miner
+# Open Pearl Miner
 
 A high-performance **Pearl (PRL)** proof-of-work miner for **NVIDIA Pascal GPUs** —
-Tesla P40, GTX 1070 / 1080 (and other `sm_61`, DP4A-capable cards).
+Tesla P40, GTX 1070 / 1080 (and other `sm_61`, DP4A-capable cards). (Experimental support for sm80+ tensor cores in progress)
 
 No Python, CUDA toolkit, or PyTorch required **to run** — the CUDA runtime is bundled
 in pre-built releases. Just an NVIDIA driver and the standalone binary.
