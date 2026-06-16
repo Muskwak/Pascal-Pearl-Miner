@@ -342,6 +342,78 @@ int main(int argc, char** argv) {
     LDM(256,128,16,1,8,3,1);
     #undef LDM
 
+    printf("\n--- ldm_dyn kernel (dynamic smem, >48KB / 2 blocks) ---\n");
+    {   // correctness vs DP4A
+        const int cm=256, cn=256, ck=(k>=4096?4096:k), cR=R;
+        const int ctiles=(cm/16)*(cn/16);
+        size_t szA=(size_t)cm*ck, szBt=(size_t)cn*ck, szTc=(size_t)ctiles*16*4;
+        int8_t *cA,*cBt; uint32_t *cTp,*cTa;
+        cudaMalloc(&cA,szA);cudaMalloc(&cBt,szBt);cudaMalloc(&cTp,szTc);cudaMalloc(&cTa,szTc);
+        int t2=256;
+        fill_det<<<(unsigned)((szA+t2-1)/t2),t2>>>(cA,szA,0x12345678);
+        fill_det<<<(unsigned)((szBt+t2-1)/t2),t2>>>(cBt,szBt,0x87654321);
+        cudaMemset(cTp,0,szTc);cudaMemset(cTa,0,szTc);cudaDeviceSynchronize();
+        launch_pearl_gemm_only(cA,cBt,cm,cn,ck,cR,cTp,1,0);
+        cudaError_t we=launch_ldm_dyn<64,256,4,1,16,3,1>(cA,cBt,cm,cn,ck,cR,cTa,0);
+        cudaDeviceSynchronize();
+        if(we!=cudaSuccess) printf("  launch err: %s\n",cudaGetErrorString(we));
+        else {
+            uint32_t *hp=(uint32_t*)malloc(szTc),*ha=(uint32_t*)malloc(szTc);
+            cudaMemcpy(hp,cTp,szTc,cudaMemcpyDeviceToHost);
+            cudaMemcpy(ha,cTa,szTc,cudaMemcpyDeviceToHost);
+            int d=0;for(int i=0;i<ctiles*16;i++)if(hp[i]!=ha[i])d++;
+            printf("  correctness (NT=16): %s (%d/%d differ)\n", d==0?"BIT-EXACT PASS":"FAIL", d, ctiles*16);
+            free(hp);free(ha);
+        }
+        cudaFree(cA);cudaFree(cBt);cudaFree(cTp);cudaFree(cTa);
+    }
+    #define LDMD(BM,BN,WM,WN,NT,STG,MNB) do { \
+        double _at=(double)((m/BM)*(BM/16))*(double)((n/BN)*(BN/16)); \
+        const char* _bad=((m%BM)||(n%BN))?"*":" "; \
+        cudaEvent_t a,b;cudaEventCreate(&a);cudaEventCreate(&b); \
+        for(int i=0;i<60;i++) launch_ldm_dyn<BM,BN,WM,WN,NT,STG,MNB>(A,Bt,m,n,k,R,T,0); \
+        if(cudaDeviceSynchronize()!=cudaSuccess) printf("  ldmd %dx%d NT%d s%d : launch failed\n",BM,BN,NT,STG); \
+        else { cudaEventRecord(a); \
+          for(int i=0;i<iters;i++) launch_ldm_dyn<BM,BN,WM,WN,NT,STG,MNB>(A,Bt,m,n,k,R,T,0); \
+          cudaEventRecord(b);cudaEventSynchronize(b);float ms=0;cudaEventElapsedTime(&ms,a,b);ms/=iters; \
+          printf("  ldmd%s%3dx%-3d NT%-2d s%d : %.3f ms  %.2f TH/s\n",_bad,BM,BN,NT,STG,ms,ths_from(_at,ms)); } \
+        cudaEventDestroy(a);cudaEventDestroy(b); \
+    } while(0)
+    LDMD(64,256,4,1,16,3,1);    // 2 blocks/SM (smem->100KB carveout, reg-limited to 2)
+    LDMD(64,256,4,1,16,4,1);
+    LDMD(64,256,4,1,16,5,1);
+    LDMD(128,256,8,1,16,3,1);   // current champ (36KB) for reference
+    LDMD(128,256,8,1,16,4,1);   // deeper pipe, was >48KB statically
+    LDMD(128,256,8,1,16,5,1);
+    LDMD(128,256,8,1,16,6,1);
+    LDMD(256,256,16,1,16,3,1);
+    #undef LDMD
+
+    printf("\n--- carveout sweep (L1 vs occupancy knee; co 0=maxL1 .. 100=maxShared) ---\n");
+    #define LDMC(BM,BN,WM,WN,NT,STG,CO) do { \
+        double _at=(double)((m/BM)*(BM/16))*(double)((n/BN)*(BN/16)); \
+        cudaEvent_t a,b;cudaEventCreate(&a);cudaEventCreate(&b); \
+        for(int i=0;i<60;i++) launch_ldm_dyn<BM,BN,WM,WN,NT,STG,1>(A,Bt,m,n,k,R,T,0,CO); \
+        if(cudaDeviceSynchronize()!=cudaSuccess) printf("  ldmc %dx%d s%d co%d : launch failed\n",BM,BN,STG,CO); \
+        else { cudaEventRecord(a); \
+          for(int i=0;i<iters;i++) launch_ldm_dyn<BM,BN,WM,WN,NT,STG,1>(A,Bt,m,n,k,R,T,0,CO); \
+          cudaEventRecord(b);cudaEventSynchronize(b);float ms=0;cudaEventElapsedTime(&ms,a,b);ms/=iters; \
+          printf("  ldmc %3dx%-3d NT%-2d s%d co%-3d : %.3f ms  %.2f TH/s\n",BM,BN,NT,STG,CO,ms,ths_from(_at,ms)); } \
+        cudaEventDestroy(a);cudaEventDestroy(b); \
+    } while(0)
+    LDMC(64,256,4,1,16,2,0);
+    LDMC(64,256,4,1,16,2,32);
+    LDMC(64,256,4,1,16,2,50);
+    LDMC(64,256,4,1,16,2,64);
+    LDMC(64,256,4,1,16,2,100);
+    LDMC(64,256,4,1,16,3,32);
+    LDMC(64,256,4,1,16,3,64);
+    LDMC(64,256,4,1,16,3,100);
+    LDMC(64,128,4,1,8,3,32);
+    LDMC(64,128,4,1,8,3,64);
+    LDMC(64,128,4,1,8,3,100);
+    #undef LDMC
+
     printf("\n--- wide1 kernel (1 sync/k-tile) ---\n");
     {   // correctness vs DP4A
         const int cm=256, cn=256, ck=(k>=4096?4096:k), cR=R;

@@ -104,8 +104,22 @@ wash (conflicts returned), the combo unblocked the tensor pipe (37.6→43%), and
 **latency-bound under 16.5% occupancy** (`wait` ~2.2 + `long_scoreboard` ~2.0, tensor ~43%).
 The remaining ~16% to 25 needs an **occupancy win that doesn't cost ILP** — the only real lever
 left is **dynamic shared memory** (`cudaFuncAttributeMaxDynamicSharedMemorySize`, up to 100 KB on
-Ada vs the 48 KB static cap) to fit more stages/blocks per SM. That's a bigger refactor (static
-`__shared__` → `extern __shared__`); deferred. 21.4 bit-exact is the shipping kernel.
+Ada vs the 48 KB static cap) to fit more stages/blocks per SM.
+
+### Dynamic smem + carveout sweep (iter 13) — explored, does NOT beat 21.1
+Built `pearl_ampere_ldm_dyn_kernel` (single `extern __shared__`, manual pipe+transcript offsets)
++ a `carveout` knob. Findings on the 4050 (Ada = 128 KB unified L1/shared, shared ≤100 KB):
+- **Deeper pipelines** (128×256 s4/s5/s6, 1 block) — no gain (20.4–20.9 < 21.1); s3 already hides it.
+- **Occupancy 2nd block** needs a bigger shared carveout; the L1↔shared **knee** is real:
+  `64×256 s2` co0/32 = 1 blk = **15.0**, co50/64 = 2 blk (+64 KB L1) = **19.9**, co100 (28 KB L1) = 19.1.
+  So mid-carveout (your "somewhere in the middle") *is* best among 2-block configs — but it tops out
+  at **19.9 < 21.1**, because `128×256 s3` already reaches the same **8 warps/SM** AND all 8 warps
+  share one B tile (amortizing cp.async), which the 2×`64×256` blocks don't.
+**Conclusion: 21.1 (static 128×256 s3) is the ceiling for this kernel structure.** Dynamic smem is
+kept (bit-exact alt; may win on other GPUs) but the dispatcher stays on the static path. Reaching
+ipminer's ~27 would need a **register-frugal redesign** (fold tiles incrementally to free the NT=16
+accumulators → fit 2 blocks of 128×256 = 16 warps/SM with full B-amortization) — high risk, deferred.
+**21.4 bit-exact is the shipping kernel.**
 
 ## Invariant
 Every change must keep `bench_ampere.exe` reporting **BIT-EXACT PASS** (TC transcript ==
