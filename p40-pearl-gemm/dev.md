@@ -115,11 +115,22 @@ Built `pearl_ampere_ldm_dyn_kernel` (single `extern __shared__`, manual pipe+tra
   So mid-carveout (your "somewhere in the middle") *is* best among 2-block configs — but it tops out
   at **19.9 < 21.1**, because `128×256 s3` already reaches the same **8 warps/SM** AND all 8 warps
   share one B tile (amortizing cp.async), which the 2×`64×256` blocks don't.
-**Conclusion: 21.1 (static 128×256 s3) is the ceiling for this kernel structure.** Dynamic smem is
-kept (bit-exact alt; may win on other GPUs) but the dispatcher stays on the static path. Reaching
-ipminer's ~27 would need a **register-frugal redesign** (fold tiles incrementally to free the NT=16
-accumulators → fit 2 blocks of 128×256 = 16 warps/SM with full B-amortization) — high risk, deferred.
-**21.4 bit-exact is the shipping kernel.**
+### WARPS_N occupancy sweep (iter 14) — falsifies the register-frugal redesign
+The kernel already has a `WARPS_N` param: WN>1 makes WN warps cooperate on the same 256-wide
+block, each holding **NT/WN** accumulators — i.e. the exact "register-frugal" split (fewer regs/warp
+→ more warps/SM) with **no rewrite**. Swept it (all bit-exact):
+- 128×256 **WN1** NT16 (8 warps/SM) = **21.1**  ← still best
+- 128×256 WN2 NT8 (16 warps/SM) = 19.4 ;  WN4 NT4 (32 warps/SM) = 18.4
+- 64×256 WN2 NT8 = 16.5
+**More occupancy consistently HURTS** — each warp loses ILP, and this kernel is **ILP-bound, not
+occupancy-bound**. So the register-frugal redesign would land *below* 21.1; its premise is
+empirically false. (Note: target is Ada/sm_89 RTX 4050 — AD107, 20 SM, 128 KB L1+shared/SM. The
+`ampere`/`sm_80+` naming is just the tensor-core ISA baseline Ada inherits.)
+
+**Conclusion: 21.4 TH/s (static 128×256 NT16 s3) is the firm structural ceiling.** Every
+occupancy/register lever (dynamic smem, carveout, WARPS_N) makes it worse; every ILP/load lever
+(ILP, swizzle, ldmatrix, B-amortization) is spent. ipminer's ~27 must come from a different
+algorithm or hand-tuned SASS, not from tuning this design. **21.4 bit-exact is the shipping kernel.**
 
 ## Invariant
 Every change must keep `bench_ampere.exe` reporting **BIT-EXACT PASS** (TC transcript ==

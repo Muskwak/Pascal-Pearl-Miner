@@ -313,7 +313,13 @@ int main(int argc, char** argv) {
             cudaMemcpy(hp,cTp,szTc,cudaMemcpyDeviceToHost);
             cudaMemcpy(ha,cTa,szTc,cudaMemcpyDeviceToHost);
             int d=0;for(int i=0;i<ctiles*16;i++)if(hp[i]!=ha[i])d++;
-            printf("  correctness (NT=16): %s (%d/%d differ)\n", d==0?"BIT-EXACT PASS":"FAIL", d, ctiles*16);
+            printf("  correctness (WN=1 NT=16): %s (%d/%d differ)\n", d==0?"BIT-EXACT PASS":"FAIL", d, ctiles*16);
+            // WN=2: 2 warps split the 256-wide block, NT=8 each (half the accumulators)
+            cudaMemset(cTa,0,szTc);
+            launch_ldm<128,256,8,2,8,3,1>(cA,cBt,cm,cn,ck,cR,cTa,0); cudaDeviceSynchronize();
+            cudaMemcpy(ha,cTa,szTc,cudaMemcpyDeviceToHost);
+            int d2=0;for(int i=0;i<ctiles*16;i++)if(hp[i]!=ha[i])d2++;
+            printf("  correctness (WN=2 NT=8):  %s (%d/%d differ)\n", d2==0?"BIT-EXACT PASS":"FAIL", d2, ctiles*16);
             free(hp);free(ha);
         }
         cudaFree(cA);cudaFree(cBt);cudaFree(cTp);cudaFree(cTa);
@@ -340,6 +346,13 @@ int main(int argc, char** argv) {
     LDM(128,256,8,1,16,3,1);
     LDM(256,256,16,1,16,2,1);   // biggest block: 16 warps share B (max amortization)
     LDM(256,128,16,1,8,3,1);
+    // WARPS_N>1: warps cooperate on the same 256-wide block -> NT/WN accumulators
+    // per warp -> more warps/SM (occupancy) at the same smem. (free, no rewrite)
+    LDM(128,256,8,2,8,3,1);     // 512 thr = 16 warps/SM, NT8
+    LDM(128,256,8,4,4,3,1);     // 1024 thr = 32 warps/SM, NT4
+    LDM(64,256,4,2,8,3,1);      // 256 thr, 8 warps, NT8
+    LDM(64,256,4,4,4,3,1);      // 512 thr, 16 warps, NT4
+    LDM(128,128,8,2,4,3,2);     // 512 thr, NT4, BN128
     #undef LDM
 
     printf("\n--- ldm_dyn kernel (dynamic smem, >48KB / 2 blocks) ---\n");
