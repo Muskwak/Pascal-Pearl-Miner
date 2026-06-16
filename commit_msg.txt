@@ -1,0 +1,17 @@
+Add Ampere (sm_80+) tensor-core int8 GEMM kernel
+
+Implements a self-contained tensor-core mma.sync.aligned.m16n8k32
+kernel with cp.async pipeline for Ampere/Ada GPUs, with auto-arch
+dispatch (Pascal DP4A fallback for pre-sm_80).
+
+- csrc/gemm/pearl_ampere_tc.cu: New Ampere TC kernel with CuTe-
+  derived register layout (direct LDS + manual packing, no ldmatrix)
+- csrc/capi/p40_capi.cu: Auto-dispatch sm_80+ -> Ampere, else DP4A
+- csrc/gemm/bindings.cpp: PyTorch extension dispatch path
+- packaging/build_capi.bat/sh: Add new source, fix CUTLASS_DIR
+- setup.py: Add pearl_ampere_tc.cu with sm_80+ gencode
+- tests/test_transcript_compare.cu: Transcript comparison test
+
+Transcripts are bit-exact with Pascal DP4A across R=64,128,256.
+~16 TFLOPS peak on RTX 4050 Laptop GPU (sm_89).
+Share accepted by LuckyPool.
