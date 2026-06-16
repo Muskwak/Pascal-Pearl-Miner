@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -24,6 +25,7 @@
 
 #include "../csrc/gemm/pearl_gemm_only_sm61.cu"
 #include "../csrc/gemm/pearl_ampere_tc.cu"
+#include "../csrc/gemm/pearl_blake3_sm61.cu"   // launch_pearl_blake3 (needs -I csrc)
 
 __global__ void fill_det(int8_t* buf, int64_t numel, uint64_t seed) {
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -93,6 +95,26 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop; CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("Device: %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);
 
+    // ---------- prof mode: one clean dispatcher launch for ncu ----------
+    // Usage: bench_ampere.exe prof [m] [n]   (defaults 4096x4096x4096 R256)
+    // The ONLY tensor-core kernel launched here is the real-config wide kernel,
+    // so `ncu -k pearl_ampere_wide_kernel -c 1` profiles exactly it (1024 blocks).
+    if (argc >= 2 && strcmp(argv[1], "prof") == 0) {
+        int pm = (argc>=3?atoi(argv[2]):4096), pn = (argc>=4?atoi(argv[3]):4096), pk = 4096, pR = 256;
+        size_t szA=(size_t)pm*pk, szBt=(size_t)pn*pk, szT=(size_t)(pm/16)*(pn/16)*16*4;
+        int8_t *A,*Bt; uint32_t *T;
+        CUDA_CHECK(cudaMalloc(&A,szA)); CUDA_CHECK(cudaMalloc(&Bt,szBt)); CUDA_CHECK(cudaMalloc(&T,szT));
+        int thr=256;
+        fill_det<<<(unsigned)((szA+thr-1)/thr),thr>>>(A,szA,0x1111);
+        fill_det<<<(unsigned)((szBt+thr-1)/thr),thr>>>(Bt,szBt,0x2222);
+        CUDA_CHECK(cudaMemset(T,0,szT)); CUDA_CHECK(cudaDeviceSynchronize());
+        launch_pearl_ampere(A,Bt,pm,pn,pk,pR,T,0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("prof: launched dispatcher @ %dx%dx%d R=%d\n", pm,pn,pk,pR);
+        cudaFree(A);cudaFree(Bt);cudaFree(T);
+        return 0;
+    }
+
     // ---------- bit-exact correctness (small grid, real R) ----------
     {
         const int cm = 256, cn = 256, ck = (k >= 4096 ? 4096 : k), cR = R;
@@ -137,6 +159,29 @@ int main(int argc, char** argv) {
     printf("  TC   : %.3f ms/region  ->  %.2f TH/s   (%.1f INT8 TOPS)\n", tc_ms, ths_from(tiles,tc_ms), tops);
     printf("  DP4A : %.3f ms/region  ->  %.2f TH/s\n", dp_ms, ths_from(tiles,dp_ms));
     printf("  TC speedup vs DP4A: %.2fx\n", dp_ms/tc_ms);
+
+    // ---------- BLAKE3 pass (the other half of pearl_pow_split) ----------
+    {
+        const int num_tiles = (m/16)*(n/16);
+        uint32_t *dkey,*dtgt; uint8_t* digests; int *found,*coord;
+        CUDA_CHECK(cudaMalloc(&dkey,32)); CUDA_CHECK(cudaMalloc(&dtgt,32));
+        CUDA_CHECK(cudaMalloc(&digests,(size_t)num_tiles*32));
+        CUDA_CHECK(cudaMalloc(&found,4)); CUDA_CHECK(cudaMalloc(&coord,8));
+        CUDA_CHECK(cudaMemset(dkey,0x5a,32)); CUDA_CHECK(cudaMemset(dtgt,0,32)); // target 0 -> no hits (clean timing)
+        CUDA_CHECK(cudaMemset(found,0,4));
+        cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
+        for(int i=0;i<5;i++) launch_pearl_blake3(T,num_tiles,n,dkey,dtgt,digests,found,coord,0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaEventRecord(a);
+        for(int i=0;i<iters;i++) launch_pearl_blake3(T,num_tiles,n,dkey,dtgt,digests,found,coord,0);
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        float bms=0; cudaEventElapsedTime(&bms,a,b); bms/=iters;
+        double full = tc_ms + bms;
+        printf("  BLAKE3: %.3f ms/region   GEMM+BLAKE3: %.3f ms -> %.2f TH/s (end-to-end est, GEMM is %.0f%%)\n",
+               bms, full, ths_from(tiles, full), 100.0*tc_ms/full);
+        cudaEventDestroy(a);cudaEventDestroy(b);
+        cudaFree(dkey);cudaFree(dtgt);cudaFree(digests);cudaFree(found);cudaFree(coord);
+    }
 
     printf("\n--- config sweep (BMxBN warpsMxN stages minb) ---\n");
     #define SWEEP(BM,BN,WM,WN,STG,MNB) do { \

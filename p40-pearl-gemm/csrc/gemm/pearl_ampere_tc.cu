@@ -104,6 +104,47 @@ __device__ __forceinline__ void load_B_frag_m16n8k32(
     b[1] = *(const uint32_t*)&smem_B[col * BLOCK_K + base_k + 16];
 }
 
+// ====== Conflict-free swizzled variants (stride == 32, i.e. BLOCK_K==32) ======
+//
+// The plain loaders above 2-way bank-conflict: with a 32-byte row stride (8
+// banks), the 8 simultaneously-read rows (tid_y) land on only 16 distinct banks
+// (tid_y and tid_y+4 alias). We remove the conflict with a zero-cost XOR
+// swizzle: logical element (row,kk) is stored at physical kk ^ (((row>>2)&1)<<4)
+// — i.e. the two 16-byte half-rows are swapped for rows with bit-2 set. The 8
+// rows then map to bank groups {0,8,16,24,4,12,20,28} (all distinct). Applied
+// identically on store (swz32) and load (_swz), the MMA fragments are bit-exact.
+//
+// On the store side, kk lives in bits[4:0] of the byte offset i and the row in
+// bits[..:5], so (row>>2)&1 == (i>>7)&1 and the chunk bit is bit-4:
+__device__ __forceinline__ int swz32(int i) { return i ^ (((i >> 7) & 1) << 4); }
+
+// On the load side, the block-relative base (warp_m*16 / warp_n*NT*16 / +8) is
+// always a multiple of 16, so its contribution to (abs_idx>>2)&1 is 0 and the
+// swizzle bit reduces to (tid_y>>2)&1 for every fragment register.
+__device__ __forceinline__ void load_A_frag_swz(uint32_t a[4], const int8_t* smem_A)
+{
+    const int lane = threadIdx.x & 31;
+    const int tid_x = lane & 3;
+    const int tid_y = lane >> 2;
+    const int base_k = tid_x * 4;
+    const int s = ((tid_y >> 2) & 1) << 4;   // chunk-swap (XOR bit 4)
+    a[0] = *(const uint32_t*)&smem_A[ tid_y      * 32 + ( base_k        ^ s)];
+    a[1] = *(const uint32_t*)&smem_A[(tid_y + 8) * 32 + ( base_k        ^ s)];
+    a[2] = *(const uint32_t*)&smem_A[ tid_y      * 32 + ((base_k + 16)  ^ s)];
+    a[3] = *(const uint32_t*)&smem_A[(tid_y + 8) * 32 + ((base_k + 16)  ^ s)];
+}
+
+__device__ __forceinline__ void load_B_frag_swz(uint32_t b[2], const int8_t* smem_B)
+{
+    const int lane = threadIdx.x & 31;
+    const int tid_x = lane & 3;
+    const int tid_y = lane >> 2;
+    const int base_k = tid_x * 4;
+    const int s = ((tid_y >> 2) & 1) << 4;
+    b[0] = *(const uint32_t*)&smem_B[tid_y * 32 + ( base_k        ^ s)];
+    b[1] = *(const uint32_t*)&smem_B[tid_y * 32 + ((base_k + 16)  ^ s)];
+}
+
 __device__ __forceinline__ void extract_D_m16n8k32(
     int32_t acc[4], int32_t* smem_D, int ldm)
 {
@@ -479,11 +520,11 @@ pearl_ampere_wide_kernel(
                 int8_t* sB = &smem_pipe[stg * SMEM_STAGE + SMEM_A];
                 for (int i = tid * 16; i < SMEM_A; i += blockDim.x * 16) {
                     const int row = i / BLOCK_K, col = i % BLOCK_K;
-                    cp_async_16B(&sA[i], &A[(size_t)(row_base + row) * k + k_off + col]);
+                    cp_async_16B(&sA[swz32(i)], &A[(size_t)(row_base + row) * k + k_off + col]);
                 }
                 for (int i = tid * 16; i < SMEM_B; i += blockDim.x * 16) {
                     const int col = i / BLOCK_K, row = i % BLOCK_K;
-                    cp_async_16B(&sB[i], &Bt[(size_t)(col_base + col) * k + k_off + row]);
+                    cp_async_16B(&sB[swz32(i)], &Bt[(size_t)(col_base + col) * k + k_off + row]);
                 }
                 cp_async_commit();
             }
@@ -494,12 +535,12 @@ pearl_ampere_wide_kernel(
                 const int8_t* sA = &smem_pipe[comp * SMEM_STAGE];
                 const int8_t* sB = &smem_pipe[comp * SMEM_STAGE + SMEM_A];
                 uint32_t a_frag[4];
-                load_A_frag_m16n8k32(a_frag, &sA[warp_m * 16 * BLOCK_K], BLOCK_K);
+                load_A_frag_swz(a_frag, &sA[warp_m * 16 * BLOCK_K]);
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
                     uint32_t bL[2], bR[2];
-                    load_B_frag_m16n8k32(bL, &sB[(warp_n * NT * 16 + nt * 16) * BLOCK_K], BLOCK_K);
-                    load_B_frag_m16n8k32(bR, &sB[(warp_n * NT * 16 + nt * 16 + 8) * BLOCK_K], BLOCK_K);
+                    load_B_frag_swz(bL, &sB[(warp_n * NT * 16 + nt * 16) * BLOCK_K]);
+                    load_B_frag_swz(bR, &sB[(warp_n * NT * 16 + nt * 16 + 8) * BLOCK_K]);
                     mma_m16n8k32(accL[nt], a_frag, bL, accL[nt]);
                     mma_m16n8k32(accR[nt], a_frag, bR, accR[nt]);
                 }
@@ -697,11 +738,18 @@ cudaError_t launch_pearl_ampere(
     uint32_t* transcript_buffer,
     cudaStream_t stream)
 {
-    cudaDeviceProp prop;
-    cudaError_t err = cudaGetDeviceProperties(&prop, 0);
-    if (err != cudaSuccess) return err;
-
-    if (prop.major < 8) {
+    // Cache the compute-capability check: cudaGetDeviceProperties populates a
+    // large struct and costs ~0.3 ms/call — calling it on every per-region launch
+    // was an ~8% host tax. One process pins one device (multi-GPU = one subprocess
+    // per device), so device 0's major version is stable for the process lifetime.
+    static int s_major = -1;
+    if (s_major < 0) {
+        cudaDeviceProp prop;
+        cudaError_t err = cudaGetDeviceProperties(&prop, 0);
+        if (err != cudaSuccess) return err;
+        s_major = prop.major;
+    }
+    if (s_major < 8) {
         return cudaErrorNotSupported;
     }
 

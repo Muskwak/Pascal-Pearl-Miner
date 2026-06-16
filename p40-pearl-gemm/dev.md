@@ -37,6 +37,8 @@ bottleneck** (BLAKE3 + noise + host overhead ≈ 10%). So optimize the GEMM.
 | 5 | **Wide kernel** — each warp computes **NT** adjacent 16×16 tiles → **NT·2 independent accumulator chains** (small 32-k smem kept) | NT2=13.0, NT4=14.6, NT8=16.7, **NT16=17.6** | ✅ **the real fix** — ILP, not occupancy/sync |
 | 6 | **wide1** — same but 1 `__syncthreads`/k-tile (sw-pipeline, prefetch far stage) | NT8=16.8, NT16=16.8 | ❌ no gain — syncs were never the bottleneck |
 | 7 | Wire **wide NT16 (64×256)** into the dispatcher (n%256,m%64), NT8 fallback | TC path **8.9 → 16.2 TH/s (2.41× DP4A)** | ✅ shipped in `launch_pearl_ampere` |
+| 8 | **XOR-swizzle smem** (`kk ^ (((row>>2)&1)<<4)`) → conflict-free A/B frag loads, zero extra smem, bit-exact | NT16 17.6 → **18.0**; bank conflicts **35.7M → 0**, shared-ld wavefronts **72.6M → 37.0M** | ✅ shipped (`swz32`/`load_*_swz`) — small TH/s gain but unblocks ldmatrix |
+| 9 | **Cache the dispatcher arch check** (was calling `cudaGetDeviceProperties` per region, ~0.3 ms) | TC path 16.3 → **16.7** (~8% host tax removed; real-miner per-region) | ✅ shipped |
 
 ### Key insight — it was ILP all along
 `mma(acc,a,b,acc)` makes each accumulator a **serial dependency chain**. The fused kernel
@@ -55,12 +57,39 @@ cover fewer tiles and *inflate* TH/s. The bench now flags non-dividing configs w
 **Wide NT=16 (64×256, 2 stages) = ~16–17.6 TH/s GEMM (≈33 INT8 TOPS, ~35% of peak)** —
 bit-exact, shipped via the dispatcher. **~2× the 8 TH/s baseline.**
 
-## Now LSU-bound
-At NT=16 each step issues ~68 shared loads (`LDS.32`) vs 32 MMAs (2:1) — the load/store
-unit is the new ceiling. Next lever: **`ldmatrix.sync`** (1 instr loads a whole fragment,
-~2–4× fewer LDS) + swizzled smem to avoid bank conflicts. Risk: ldmatrix layout must
-reproduce the exact mma fragment (bit-exact). Also: re-measure end-to-end (BLAKE3 + noise
-may now be a meaningful slice of the per-region time).
+## End-to-end split (measured)
+BLAKE3 over the transcript = **0.025 ms/region**; GEMM = 4.22 ms. So GEMM is **99%**
+of `pearl_pow_split`, and noise (amortized per row/col block) + host loop are the only
+other costs. **The GEMM is essentially the whole end-to-end cost** — optimizing it is
+exactly right, and end-to-end ≈ GEMM (minus ~10% fixed overhead).
+
+## Profiled with Nsight Compute (ncu 2025.1) — the real bottleneck
+`tests/prof.ps1` builds + scp's + runs `ncu` against a single clean launch (the bench's
+`prof` mode launches the dispatcher once at 4096² → 1024 blocks). Wide NT16 **before**
+the swizzle:
+```
+L1/TEX throughput 71%  (Memory 70%, "L1 bottleneck")   DRAM 2%  (L2 hit 97.6%)
+Tensor pipe 36.5%  ("well-utilized, should NOT be a bottleneck")  — 2× headroom
+Scheduler No-Eligible 80%   active warps/sched 1.98   Occupancy 16.7% (reg+smem limited, 2 blk/SM)
+Stalls (per-issue): wait 2.51 | mio_throttle 2.45 | long_scoreboard 1.80 | math 0.91 | barrier 0.76
+Bank conflicts 35.7M of 72.6M shared-ld wavefronts  (~49% are conflict replays!)
+```
+→ **L1/shared-load-bound**, tensor idle. The bank conflicts (iter 8) and the dispatcher
+tax (iter 9) were the two findings. **After** the swizzle: conflicts **0**, wavefronts
+**37.0M**, L1/TEX **61%**, mio_throttle **2.04**, tensor **37.6%** — but only +2.4% TH/s.
+
+### Two co-limiters remain (the wall to 25 TH/s)
+1. **LSU instruction count** — LSU pipe still **61%**, `mio_throttle` 2.04. ~68 `LDS.32`/k-step
+   (1 A-frag = 4, + NT·2 B-frags × 2). **Next lever: `ldmatrix.sync`** — 1 instr fills a whole
+   fragment (A: x4 → 4 regs; B: x2 → 2 regs), ~2× fewer load instrs. The swizzle is a
+   prerequisite (ldmatrix also wants conflict-free smem). Risk: must reproduce the exact
+   mma s8 fragment layout (.b16 reinterpret + `.trans` for col-major B) — bit-exact or revert.
+2. **Latency under low occupancy** — `wait` 2.31 + `long_scoreboard` 1.62 + `barrier` 0.71 = 4.6,
+   with only ~2 warps/sched (16.5% occ, NT=16 accumulators = 128 int32 regs → 2 blk/SM).
+   Empirically *can't* be fixed by lowering NT: NT8 (½ the regs) = 17.96 ≈ NT16 18.0, so the
+   ILP gain from big NT cancels the occupancy gain from small NT. ILP ≥ occupancy here.
+
+So 25 TH/s likely needs **ldmatrix AND** an occupancy/latency win; ldmatrix alone ≈ 20–22 est.
 
 ## Invariant
 Every change must keep `bench_ampere.exe` reporting **BIT-EXACT PASS** (TC transcript ==
