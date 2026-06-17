@@ -51,7 +51,6 @@ cute_pearl_fold(int M, int N, int K, int R,
     // persistent per-CTA transcript (bM/16 * bN/16 tiles, TLEN words) + per-fold partial
     constexpr int TILES = (bM/16) * (bN/16);   // 8*16 = 128
     __shared__ uint32_t sT[TILES * TLEN];
-    __shared__ uint32_t sCur[TILES];
     for (int i = threadIdx.x; i < TILES*TLEN; i += blockDim.x) sT[i] = 0;
 
     GCopyA_ copyA; GCopyB_ copyB;
@@ -102,37 +101,31 @@ cute_pearl_fold(int M, int N, int K, int R,
         gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
         ww = (ww+1) % Stages; wr = (wr+1) % Stages;
 
-        // ---- R-block boundary: per-atom shfl fold (correct + fast, no atomics) ----
-        // Each atom (16x8) is warp-owned; XOR the lane's 4 int32, shfl-reduce across the 32
-        // lanes -> the atom's XOR. lane0 XOR-accumulates it into the atom's COORDINATE-derived
-        // CTA-local tile in sCur (warp-disjoint tiles -> no atomics; the 2 atoms of a 16x16
-        // tile XOR together there). Then rotl-13 fold sCur -> the persistent transcript sT.
+        // ---- R-block boundary: warp-owned-tile fold (direct in-register, no atomics/syncs) ----
+        // With <8,1,1> each warp owns a full 16-row band = 16 contiguous 16x16 tiles (N never
+        // split), and atom-N (2k,2k+1) are the two 8-col halves of tile k. XOR the lane's 8
+        // int32, shfl across the warp, lane0 rotl-13 folds into the tile's transcript slot.
         if ((kt+1) % kt_per_R == 0) {
             int rb = kt / kt_per_R;
             const int lane = threadIdx.x & 31;
-            for (int i = threadIdx.x; i < TILES; i += blockDim.x) sCur[i] = 0;
-            __syncthreads();
             CUTE_UNROLL
             for (int tm = 0; tm < size<1>(tCrC); ++tm)
             CUTE_UNROLL
-            for (int tn = 0; tn < size<2>(tCrC); ++tn) {
+            for (int k = 0; k < size<2>(tCrC)/2; ++k) {
                 uint32_t pv = 0;
                 CUTE_UNROLL
-                for (int v = 0; v < size<0>(tCrC); ++v) pv ^= (uint32_t)tCrC(v,tm,tn);
+                for (int v = 0; v < size<0>(tCrC); ++v) {
+                    pv ^= (uint32_t)tCrC(v,tm,2*k); pv ^= (uint32_t)tCrC(v,tm,2*k+1);
+                }
                 CUTE_UNROLL
                 for (int off = 16; off > 0; off >>= 1) pv ^= __shfl_xor_sync(0xffffffffu, pv, off);
                 if (lane == 0) {
-                    auto mn = tCcC(0, tm, tn);
+                    auto mn = tCcC(0, tm, 2*k);
                     int lt = (get<0>(mn) >> 4) * (bN/16) + (get<1>(mn) >> 4);
-                    atomicXor(&sCur[lt], pv);   // 2 warps share a 16-col tile -> atomic combine
+                    uint32_t prev = sT[lt*TLEN + rb];
+                    sT[lt*TLEN + rb] = ((prev << HASH_ROT) | (prev >> (32-HASH_ROT))) ^ pv;
                 }
             }
-            __syncthreads();
-            for (int lt = threadIdx.x; lt < TILES; lt += blockDim.x) {
-                uint32_t prev = sT[lt*TLEN + rb];
-                sT[lt*TLEN + rb] = ((prev << HASH_ROT) | (prev >> (32-HASH_ROT))) ^ sCur[lt];
-            }
-            __syncthreads();
         }
     }
 
@@ -169,7 +162,7 @@ int main() {
     launch_pearl_gemm_only(dA,dB,M,N,K,R,dTref,1,0); CK(cudaDeviceSynchronize());
 
     using MMA_Atom_ = MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>;
-    using TiledMMA_ = decltype(make_tiled_mma(MMA_Atom_{}, Layout<Shape<_4,_2,_1>>{}));
+    using TiledMMA_ = decltype(make_tiled_mma(MMA_Atom_{}, Layout<Shape<_8,_1,_1>>{}));
     using SwzA = decltype(composition(Swizzle<2,4,3>{}, Layout<Shape<Int<bM>,Int<bK>>, Stride<Int<bK>,Int<1>>>{}));
     using SmemLayoutA_ = decltype(tile_to_shape(SwzA{}, make_shape(Int<bM>{}, Int<bK>{}, Int<Stages>{})));
     using SwzB = decltype(composition(Swizzle<2,4,3>{}, Layout<Shape<Int<bN>,Int<bK>>, Stride<Int<bK>,Int<1>>>{}));
