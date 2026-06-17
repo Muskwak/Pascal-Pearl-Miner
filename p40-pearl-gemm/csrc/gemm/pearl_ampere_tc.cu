@@ -9,6 +9,11 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// Fused CuTe kernel (int8 GEMM + in-mainloop transcript fold), ~32.75 TH/s on Ada,
+// bit-exact with DP4A. Primary 128x256 path; the hand `ldm` kernels below remain as
+// fallbacks for non-32-aligned R and smaller alignments. Namespaced (pcute::).
+#include "pearl_cute_fold.cuh"
+
 // ==================================================================
 // PTX helper functions — device-only (use asm which requires sm_80+)
 // ==================================================================
@@ -1400,14 +1405,19 @@ cudaError_t launch_pearl_ampere(
     dim3 block;
     int grids_m, grids_n;
 
-    // Best on Ada (AD107): `ldm` kernel — wide-style register tiling (NT 16×16
-    // tiles/warp -> NT*2 independent accumulator chains for ILP) + ldmatrix loads
-    // (1 warp instr/fragment) + XOR-swizzled, conflict-free smem. ncu-tuned on the
-    // RTX 4050: 8 -> 21 TH/s. 128×256 (8 warps share the B tile, amortizing the
-    // cp.async loads) is the sweet spot; falls back by decreasing m/n alignment.
+    // Best on Ada (AD107): fused CuTe kernel — int8 GEMM + in-mainloop transcript
+    // fold, multistage cp.async.cg + ldmatrix, <8,1,1> TiledMMA (each warp owns a
+    // 16-row band so the fold is a direct in-register shfl_xor). 32.75 TH/s on the
+    // RTX 4050, bit-exact with DP4A — vs the hand `ldm` kernel's 24.0 (+36%). The
+    // 128×256 region is the real mining shape (4096³ regions, R=256). For R not a
+    // multiple of the 32-wide k-tile the CuTe fold doesn't apply -> hand `ldm`.
     if (m % 128 == 0 && n % 256 == 0) {
+        if (R % block_k == 0) {
+            return pcute::launch_cute_fold<128, 256, 32, 3>(A, Bt, m, n, k, R,
+                                                            transcript_buffer, stream);  // 32.75
+        }
         return launch_ldm<128, 256, 8, 1, 16, 3, 1>(A, Bt, m, n, k, R,
-                                                     transcript_buffer, stream);  // 21.1
+                                                     transcript_buffer, stream);  // 24.0 fallback
     }
     if (m % 64 == 0 && n % 256 == 0) {
         return launch_ldm<64, 256, 4, 1, 16, 4, 1>(A, Bt, m, n, k, R,
