@@ -7,23 +7,23 @@ No Python, CUDA toolkit, or PyTorch required **to run** — the CUDA runtime is 
 in pre-built releases. Just an NVIDIA driver and the standalone binary.
 build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
 
-> Mixed-GPU rigs are supported: native code is compiled for Pascal/Turing/Ampere/Ada
-> (`sm_61/75/86/89`) plus a PTX fallback that JIT-loads on any newer NVIDIA card.
-> Pascal is the optimized target; newer cards run functionally via the DP4A path.
-
+> Mixed-GPU rigs are supported, optomized for pascal for now. but experimental ternsor core support has been added.
+> y
 ## Features
 
 - **~7.0 TH/s** sustained on a single Tesla P40.
+- **24 TH/s** on a single RTX 4050 mobile.
 - **Multi-GPU** — auto-detects every GPU and runs one worker per card, near-linear scaling.
 - **Continuous mining** — no idle time waiting between pool jobs.
 - **Background proof submission** — finding a share never stalls the search.
 - **Solo mining** — mine to your local pearl-gateway node.
 - **Pool mining** — built for LuckyPool's Pearl stratum (default) with more pool protocols planned.
 - **HiveOS** — full HiveOS custom-miner package.
+  y
 
 ## Pre-built Releases
 
-Grab the latest binary from the [Releases](https://github.com/Muskwak/Pascal-Pearl-Miner/releases) page:
+Grab the latest binary from the [Releases](https://github.com/Muskwak/Open-Pearl-Miner/releases) page:
 
 | File | Platform |
 |------|----------|
