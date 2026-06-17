@@ -7,7 +7,7 @@ No Python, CUDA toolkit, or PyTorch required **to run** — the CUDA runtime is 
 in pre-built releases. Just an NVIDIA driver and the standalone binary.
 build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
 
-> Mixed-GPU rigs are supported,y experimental ternsor core support has been added.
+> Mixed-GPU rigs are supported, experimental ternsor core support has been added.
 > 
 ## Features
 
