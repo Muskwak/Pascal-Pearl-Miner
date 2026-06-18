@@ -28,6 +28,19 @@ from pool_common import (DEV_ADDRESS, DEV_FEE, K, M, N, R, DevFeeScheduler,
 
 VARIANT = 1  # pearl_pow_split S=128 4x4 MINB4
 
+# Regions launched back-to-back on the stream between host found-checks. Syncing
+# the device every region (sync + D2H + pool poll) idled the GPU through the host
+# round-trip and kept the laptop clock off boost (~28 -> ~20 TH/s). Hits are
+# astronomically rare at real difficulty, so we give each region its own found/coord
+# slot and scan the whole batch after a single sync. Tunable via P40_FOUND_BATCH.
+FOUND_BATCH = max(1, int(os.environ.get("P40_FOUND_BATCH", "64")))
+
+# Default pool by GPU class (overridden by --pool). Tensor-core cards (sm_80+) want a
+# GPU-difficulty pool; Pascal / DP4A cards (sm_61, e.g. the P40) mine fewer hashes so a
+# CPU-difficulty pool fits and avoids over-high share targets.
+POOL_GPU = "pearl-eu2.luckypool.io:3360"
+POOL_CPU = "pearl-cpu-eu1.luckypool.io:3370"
+
 
 class Bufs:
     """Device buffers reused across jobs (allocated once for the mandated dims)."""
@@ -49,9 +62,9 @@ class Bufs:
         self.dApEA = cc.DBuf(RS * K)
         self.dBt_tmp = cc.DBuf(RS * K)
         ntiles = (RS // 16) ** 2
-        self.dtb = cc.DBuf(ntiles * 16 * 4)   # reusable transcript buffer
-        self.dfound = cc.DBuf(4)
-        self.dcoord = cc.DBuf(8)
+        self.dtb = cc.DBuf(ntiles * 16 * 4)      # reusable transcript buffer
+        self.dfound = cc.DBuf(4 * FOUND_BATCH)   # one int32 found-flag per batched region
+        self.dcoord = cc.DBuf(8 * FOUND_BATCH)   # two int32 coords per batched region
         # Persistent per-column Bt_ns buffers (one per column block), reused every
         # job — recomputed per job but never re-malloc'd.
         self.dBpEB = [cc.DBuf(RS * K) for _ in range(N // RS)]
@@ -113,8 +126,8 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
 
     RS = region
     tiles_per_region = (RS // 16) ** 2
-    found = np.empty(1, np.int32)
-    coord = np.empty(2, np.int32)
+    found = np.empty(FOUND_BATCH, np.int32)
+    coord = np.empty(2 * FOUND_BATCH, np.int32)
 
     grid = 0
     t_acct = time.time()      # wall time charged to the dev-fee scheduler so far
@@ -138,50 +151,76 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
             idx = c0 // RS
             d = bufs.dBpEB[idx]
             if idx not in computed:
-                cc.transpose_i8(bufs.dB, bufs.dBt_tmp, K, RS, N, c0)  # B[:,c0:c0+RS].t()
-                cc.noise_gemm(bufs.dEBR.offset(c0 * R), bufs.dEBL, bufs.dBt_tmp, d, RS, K, R)
+                # Z = base B^T rows [c0:c0+RS], which setup_job already produced in
+                # dBt_full -- re-transposing dB here was redundant (a ~1.9% kernel).
+                cc.noise_gemm(bufs.dEBR.offset(c0 * R), bufs.dEBL,
+                              bufs.dBt_full.offset(c0 * K), d, RS, K, R)
                 computed.add(idx)
             return d
 
+        # Regions stream back-to-back; we only sync + read found once per FOUND_BATCH.
+        # Each region writes its own found/coord slot, so a single host scan after the
+        # sync recovers every (rare) hit. Reused dApEA/dBt_tmp/dtb buffers stay correct
+        # without per-region syncs because the stream is in-order.
+        batch: list[tuple[int, int]] = []   # (r0, c0) launched since the last check
+        bufs.dfound.memset(0)
+
+        def flush_batch():
+            nonlocal hits
+            if not batch:
+                return
+            cc.sync()
+            bufs.dfound.to_host(found)
+            if found[:len(batch)].any():
+                bufs.dcoord.to_host(coord)
+                for i, (br0, bc0) in enumerate(batch):
+                    if int(found[i]) != 1:
+                        continue
+                    gr, gc = br0 + int(coord[2 * i]), bc0 + int(coord[2 * i + 1])
+                    log(f"  HIT tile (row={gr}, col={gc}) grid {grid}; proof async")
+                    # Snapshot the winning grid's A and B^T to host (~160 ms D2H), then
+                    # hand the expensive (~6s CPU) Merkle proof+submit to a worker thread
+                    # so the GPU keeps mining the next grid instead of idling. B^T was
+                    # already produced on the GPU by setup_job -> no host transpose.
+                    A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
+                    Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
+                    proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify))
+                    hits += 1
+            bufs.dfound.memset(0)
+            batch.clear()
+
+        stop = False
         for r0 in range(0, M, RS):
             cc.noise_gemm(bufs.dEAL.offset(r0 * R), bufs.dEAR_t, bufs.dA.offset(r0 * K),
                           bufs.dApEA, RS, K, R)
             for c0 in range(0, N, RS):
                 if max_regions and searched >= max_regions:
+                    stop = True
                     break
-                newer = pool.check_newer_job(job_id)
-                if newer is not None:
-                    log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
-                    sched.note(time.time() - t_acct)
-                    return ("NEWJOB", newer)
                 searched += 1
-                if time.time() - last_print >= 5:
-                    ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
-                    log(f"  grid {grid}: {searched} regions ({ths:.2f} TH/s, {hits} hits)")
-                    last_print = time.time()
-
+                slot = len(batch)
                 dBpEB = bt_noised(c0)
-                bufs.dfound.memset(0)
                 # digests=None: mining only needs found/coord. pow_key MUST be dnsA.
                 cc.pearl_pow_split(bufs.dApEA, dBpEB, RS, RS, K, R, bufs.dnsA, bufs.dtgt,
-                                   bufs.dtb, None, bufs.dfound, bufs.dcoord, VARIANT)
-                cc.sync()
-                bufs.dfound.to_host(found)
-                if int(found[0]) != 1:
-                    continue
-
-                bufs.dcoord.to_host(coord)
-                gr, gc = r0 + int(coord[0]), c0 + int(coord[1])
-                log(f"  HIT tile (row={gr}, col={gc}) grid {grid} region {searched}; proof async")
-                # Snapshot the winning grid's A and B^T to host (~160 ms D2H), then
-                # hand the expensive (~6s CPU) Merkle proof+submit to a worker thread
-                # so the GPU keeps mining the next grid instead of idling. B^T was
-                # already produced on the GPU by setup_job -> no host transpose.
-                A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
-                Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
-                proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify))
-                hits += 1
-                # keep scanning THIS grid for more qualifying tiles (free shares)
+                                   bufs.dtb, None, bufs.dfound.offset(slot * 4),
+                                   bufs.dcoord.offset(slot * 8), VARIANT)
+                batch.append((r0, c0))
+                if len(batch) >= FOUND_BATCH:
+                    flush_batch()
+                    # New-job poll + progress log run once per batch (off the per-region
+                    # hot path) so socket/host work never gates the GPU.
+                    newer = pool.check_newer_job(job_id)
+                    if newer is not None:
+                        log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
+                        sched.note(time.time() - t_acct)
+                        return ("NEWJOB", newer)
+                    if time.time() - last_print >= 5:
+                        ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
+                        log(f"  grid {grid}: {searched} regions ({ths:.2f} TH/s, {hits} hits)")
+                        last_print = time.time()
+            if stop:
+                break
+        flush_batch()   # drain any partial last batch
 
         ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
         log(f"  grid {grid} done: {hits} hits over {searched} regions ({ths:.2f} TH/s)")
@@ -193,6 +232,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
         if sched.maybe_switch():
             return ("SWITCH", None)
         # otherwise immediately mine another fresh grid on the SAME job -- no idle
+
 
 def _list_gpu_indices():
     """Enumerate GPU indices, nvidia-smi first (PCI-bus order to match CUDA), then
@@ -210,6 +250,33 @@ def _list_gpu_indices():
         return list(range(cc.device_count()))
     except Exception:
         return []
+
+
+def _gpu_compute_cap():
+    """Compute-capability (float, e.g. 6.1 or 8.9) of this process's visible GPU via
+    nvidia-smi. Honors CUDA_VISIBLE_DEVICES so a supervised per-card child reads its
+    own pinned GPU. Returns None if it can't be determined."""
+    idx = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    cmd = ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"]
+    if idx:
+        cmd += ["-i", idx]
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        caps = [float(x) for x in out.splitlines() if x.strip()]
+        return caps[0] if caps else None
+    except Exception:
+        return None
+
+
+def _resolve_pool(args, log):
+    """If --pool wasn't given, pick the default by GPU class: Pascal / DP4A (sm < 8.0)
+    -> CPU-difficulty pool; tensor-core (sm_80+) -> GPU-difficulty pool. Per-process, so
+    a mixed P40 + Ada rig picks the right pool for each card."""
+    if args.pool:
+        return
+    cap = _gpu_compute_cap()
+    args.pool = POOL_CPU if (cap is not None and cap < 8.0) else POOL_GPU
+    log(f"auto-selected pool {args.pool} (GPU compute_cap {cap})")
 
 
 def run_supervisor(devices, args, log):
@@ -246,9 +313,10 @@ def run_supervisor(devices, args, log):
             "--single",
             "--wallet", args.wallet,
             "--worker", f"{args.worker}-gpu{d}",
-            "--pool", args.pool,
             "--region", str(args.region),
         ]
+        if args.pool:                       # else the child auto-picks by its GPU class
+            cmd += ["--pool", args.pool]
         if args.verify:
             cmd.append("--verify")
         p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
@@ -283,7 +351,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wallet", default=None)  # required for pool mining; unused in --solo
     ap.add_argument("--worker", default="p40")
-    ap.add_argument("--pool", default="pearl-cpu-eu1.luckypool.io:3370")
+    ap.add_argument("--pool", default=None,  # auto: Pascal -> CPU pool, sm_80+ -> GPU pool
+                    help="Stratum host:port. Default: auto by GPU class.")
     ap.add_argument("--region", type=int, default=4096)
     ap.add_argument("--max-regions", type=int, default=0)
     ap.add_argument("--max-jobs", type=int, default=0)
@@ -325,14 +394,14 @@ def main():
         if not devs:
             log("no GPUs selected via --devices")
             return
-        log(f"GPUs {devs} | one worker per card | pool {args.pool}")
+        log(f"GPUs {devs} | one worker per card | pool {args.pool or 'auto (per-GPU)'}")
         run_supervisor(devs, args, log)
         return
 
     # No flag: auto-detect. Multiple GPUs -> one worker each; single GPU -> run here.
     devs = _list_gpu_indices()
     if len(devs) > 1:
-        log(f"multi-GPU: {len(devs)} GPUs {devs} | one worker per card | pool {args.pool}")
+        log(f"multi-GPU: {len(devs)} GPUs {devs} | one worker per card | pool {args.pool or 'auto (per-GPU)'}")
         run_supervisor(devs, args, log)
         return
     if devs:
@@ -343,6 +412,7 @@ def main():
 def run_single_gpu(args, log):
     """Mine on this process's one visible GPU (device 0, or the card pinned by the
     supervisor via CUDA_VISIBLE_DEVICES)."""
+    _resolve_pool(args, log)
     host, port = args.pool.rsplit(":", 1)
     log(f"p40 miner (torch-free) | pool {args.pool} | region {args.region}")
     cfg = real_config()
@@ -423,6 +493,7 @@ def run_solo(args, log):
         log(f"dev fee: {sched.fee * 100:.1f}% of mining time -- during a dev round the "
             f"GPU mines to the dev's pool wallet instead of your node (transparent; "
             f"logged on every switch). Thank you!")
+    _resolve_pool(args, log)  # dev-round pool by GPU class when --pool not given
     dh, dp = args.pool.rsplit(":", 1)
     try:
         while True:
@@ -481,8 +552,8 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
     factor = cfg.hash_tile_h * cfg.hash_tile_w * cfg.rounded_common_dim
     RS = args.region
     tiles_per_region = (RS // 16) ** 2
-    found = np.empty(1, np.int32)
-    coord = np.empty(2, np.int32)
+    found = np.empty(FOUND_BATCH, np.int32)
+    coord = np.empty(2 * FOUND_BATCH, np.int32)
     submitted = 0
     while True:
         try:
@@ -525,11 +596,46 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
                     idx = c0 // RS
                     d = bufs.dBpEB[idx]
                     if idx not in computed:
-                        cc.transpose_i8(bufs.dB, bufs.dBt_tmp, K, RS, N, c0)
+                        # Z = base B^T slice from dBt_full (setup_job) -- no re-transpose.
                         cc.noise_gemm(bufs.dEBR.offset(c0 * R), bufs.dEBL,
-                                      bufs.dBt_tmp, d, RS, K, R)
+                                      bufs.dBt_full.offset(c0 * K), d, RS, K, R)
                         computed.add(idx)
                     return d
+
+                def submit_block(gr, gc):
+                    nonlocal submitted
+                    log(f"  solo: BLOCK CANDIDATE (row={gr}, col={gc})! building proof...")
+                    A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
+                    Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
+                    proof = pearl_host.build_proof_bt(A, Bt, gr, gc, key, R)
+                    try:
+                        client.submit_plain_proof(proof, job)
+                        submitted += 1
+                        log(f"  solo: *** SUBMITTED BLOCK PROOF to gateway *** (total {submitted})")
+                    except Exception as e:
+                        log(f"  solo: submit error: {e}")
+
+                # Regions stream back-to-back; sync + found-scan only once per FOUND_BATCH
+                # so the GPU isn't gated by a host round-trip every region (~28 vs ~20 TH/s).
+                batch: list[tuple[int, int]] = []
+                bufs.dfound.memset(0)
+
+                def flush_solo():
+                    # Sync once; return (gr, gc) of the first hit in the batch, or None.
+                    if not batch:
+                        return None
+                    cc.sync()
+                    bufs.dfound.to_host(found)
+                    res = None
+                    if found[:len(batch)].any():
+                        bufs.dcoord.to_host(coord)
+                        for i, (br0, bc0) in enumerate(batch):
+                            if int(found[i]) == 1:
+                                res = (br0 + int(coord[2 * i]), bc0 + int(coord[2 * i + 1]))
+                                break
+                    bufs.dfound.memset(0)
+                    batch.clear()
+                    return res
 
                 hit = False
                 for r0 in range(0, M, RS):
@@ -537,33 +643,23 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
                                   bufs.dA.offset(r0 * K), bufs.dApEA, RS, K, R)
                     for c0 in range(0, N, RS):
                         searched += 1
-                        if time.time() - last_print >= 5:
-                            ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
-                            log(f"  solo grid {grid}: {searched} regions ({ths:.2f} TH/s)")
-                            last_print = time.time()
+                        slot = len(batch)
                         dBpEB = bt_noised(c0)
-                        bufs.dfound.memset(0)
                         cc.pearl_pow_split(bufs.dApEA, dBpEB, RS, RS, K, R, bufs.dnsA,
-                                           bufs.dtgt, bufs.dtb, None, bufs.dfound,
-                                           bufs.dcoord, VARIANT)
-                        cc.sync()
-                        bufs.dfound.to_host(found)
-                        if int(found[0]) != 1:
-                            continue
-                        bufs.dcoord.to_host(coord)
-                        gr, gc = r0 + int(coord[0]), c0 + int(coord[1])
-                        log(f"  solo: BLOCK CANDIDATE (row={gr}, col={gc})! building proof...")
-                        A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
-                        Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
-                        proof = pearl_host.build_proof_bt(A, Bt, gr, gc, key, R)
-                        try:
-                            client.submit_plain_proof(proof, job)
-                            submitted += 1
-                            log(f"  solo: *** SUBMITTED BLOCK PROOF to gateway *** (total {submitted})")
-                        except Exception as e:
-                            log(f"  solo: submit error: {e}")
-                        hit = True
-                        break
+                                           bufs.dtgt, bufs.dtb, None,
+                                           bufs.dfound.offset(slot * 4),
+                                           bufs.dcoord.offset(slot * 8), VARIANT)
+                        batch.append((r0, c0))
+                        if len(batch) >= FOUND_BATCH:
+                            res = flush_solo()
+                            if time.time() - last_print >= 5:
+                                ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
+                                log(f"  solo grid {grid}: {searched} regions ({ths:.2f} TH/s)")
+                                last_print = time.time()
+                            if res is not None:
+                                submit_block(*res)
+                                hit = True
+                                break
                     if hit:
                         break
                     # charge elapsed time per row-block; hand over if a dev round is due
@@ -571,7 +667,15 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
                     sched.note(now - t_acct)
                     t_acct = now
                     if sched.maybe_switch():
+                        res = flush_solo()
+                        if res is not None:
+                            submit_block(*res)
                         return
+                if not hit:
+                    res = flush_solo()   # drain any partial last batch
+                    if res is not None:
+                        submit_block(*res)
+                        hit = True
                 if not hit:
                     ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
                     log(f"  solo grid {grid} swept ({ths:.2f} TH/s); no candidate")
