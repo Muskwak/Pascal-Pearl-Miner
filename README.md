@@ -177,11 +177,11 @@ The same 2% dev fee applies (GPU mines to the dev's pool wallet during the 2% wi
 
 ## HiveOS
 
-Download `p40-miner-hiveos-1.2.1.tar.gz` and install it as a **Custom** miner:
+Download `p40-miner-1.6.0.tar.gz` and install it as a **Custom** miner:
 
 1. **Flight Sheet → Miner = Custom.**
 2. Set the **Installation URL** to the tarball, *or* `scp` it to the rig and run
-   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.2.1.tar.gz`.
+   `tar -C /hive/miners/custom -xzf p40-miner-1.6.0.tar.gz`.
 3. **Wallet and worker:** your Pearl wallet `prl1...` (worker name auto-appended).
 4. **Pool URL:** `pearl-cpu-eu1.luckypool.io:3370` (default LuckyPool).
 5. **Extra config arguments** (optional): `--devices 0,1`, `--region 4096`, etc.
