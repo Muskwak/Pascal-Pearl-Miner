@@ -22,7 +22,9 @@ stats=""
 mapfile -t SMI < <(nvidia-smi --query-gpu=index,pci.bus_id,temperature.gpu,fan.speed \
                    --format=csv,noheader,nounits 2>/dev/null)
 
-hs="[]"; temp="[]"; fan="[]"; bus="[]"
+# Build the arrays in pure bash (NO jq -- HiveOS images don't reliably ship it; a jq
+# dependency here silently breaks stats so the dashboard shows the rig as dead).
+hs_arr=(); temp_arr=(); fan_arr=(); bus_arr=()
 total_hs=0
 have_gpu_prefix=$(grep -c '\[gpu' "$LOG")
 
@@ -48,10 +50,7 @@ for row in "${SMI[@]}"; do
   ghs=$(awk -v t="$ths" 'BEGIN{printf "%.0f", t*1000000000000}')   # TH/s -> H/s
   total_hs=$(awk -v a="$total_hs" -v b="$ghs" 'BEGIN{printf "%.0f", a+b}')
 
-  hs=$(echo "$hs"     | jq -c ". + [$ghs]")
-  temp=$(echo "$temp" | jq -c ". + [$t]")
-  fan=$(echo "$fan"   | jq -c ". + [$f]")
-  bus=$(echo "$bus"   | jq -c ". + [$bn]")
+  hs_arr+=("$ghs"); temp_arr+=("$t"); fan_arr+=("$f"); bus_arr+=("$bn")
 done
 
 khs=$(awk -v h="$total_hs" 'BEGIN{printf "%.0f", h/1000}')          # H/s -> kH/s
@@ -65,15 +64,10 @@ uptime=0
 [[ -n "$pid" ]] && uptime=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
 [[ "$uptime" =~ ^[0-9]+$ ]] || uptime=0
 
-stats=$(jq -nc \
-  --argjson hs   "$hs" \
-  --argjson temp "$temp" \
-  --argjson fan  "$fan" \
-  --argjson bus  "$bus" \
-  --argjson up   "$uptime" \
-  --argjson acc  "${acc:-0}" \
-  --argjson rej  "${rej:-0}" \
-  '{hs: $hs, hs_units: "hs", temp: $temp, fan: $fan, uptime: $up,
-    ar: [$acc, $rej], algo: "pearl", bus_numbers: $bus}')
+# Join a bash array into a JSON-number list (empty -> "").
+_join() { local IFS=,; echo "$*"; }
+stats=$(printf '{"hs":[%s],"hs_units":"hs","temp":[%s],"fan":[%s],"uptime":%s,"ar":[%s,%s],"algo":"pearl","bus_numbers":[%s]}' \
+  "$(_join "${hs_arr[@]}")" "$(_join "${temp_arr[@]}")" "$(_join "${fan_arr[@]}")" \
+  "${uptime:-0}" "${acc:-0}" "${rej:-0}" "$(_join "${bus_arr[@]}")")
 
 echo "khs=$khs"
