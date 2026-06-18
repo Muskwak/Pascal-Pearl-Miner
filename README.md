@@ -23,7 +23,14 @@ Build it yourself or grab a pre-built release. See [License](#license) for dev-f
 - **Solo mining** — mine to your local pearl-gateway node.
 - **Pool mining** — built for LuckyPool's Pearl stratum (default) with more pool protocols planned.
 - **HiveOS** — full HiveOS custom-miner package.
-  
+
+## Roadmap
+
+- **AMD RDNA (HIP / ROCm)** — int8 WMMA GEMM + transcript-fold path for RDNA2/RDNA3
+  (`gfx10xx` / `gfx11xx`). Experimental kernels in progress.
+- **Apple Silicon (Metal)** — Metal `simdgroup_matrix` int8 path for M-series GPUs.
+- **More pools** — additional Pearl stratum protocols beyond LuckyPool.
+- **Per-kernel autotuning** — pick tile/stage parameters per GPU at startup.
 
 ## Pre-built Releases
 
@@ -139,7 +146,7 @@ CUTLASS_DIR=... python -c "import p40_pearl_gemm"  # smoke test
 |---|---|---|
 | `--wallet` | _(required)_ | Your Pearl payout address |
 | `--worker` | `p40` | Worker name shown on the pool |
-| `--pool` | `pearl-eu2.luckypool.io:3360` | Stratum `host:port` (GPU-difficulty pool) |
+| `--pool` | _(auto by GPU)_ | Stratum `host:port`. Auto: Pascal→`pearl-cpu-eu1…:3370`, sm_80+→`pearl-eu2…:3360` |
 | `--devices` | _(auto-detect all)_ | GPU selection, e.g. `0,1,2` or `all` |
 | `--region` | `4096` | Sub-output search size |
 | `--solo` | _(off)_ | Solo mine to local pearl-gateway `HOST:PORT` |
@@ -162,15 +169,18 @@ p40-miner.exe --wallet prl1YOURWALLET --devices 0,2
 
 ### Pool Mining
 
-Default: `pearl-eu2.luckypool.io:3360` (LuckyPool GPU-difficulty pool). Override with `--pool`:
+The default pool is picked automatically by GPU class: **tensor-core cards (`sm_80+`)**
+use `pearl-eu2.luckypool.io:3360` (GPU difficulty), while **Pascal / DP4A cards** (P40,
+GTX 10-series) use `pearl-cpu-eu1.luckypool.io:3370`. On a mixed rig each card picks its
+own. Override for any card with `--pool`:
 
 ```
 p40-miner.exe --wallet prl1YOURWALLET --pool pearl-cpu-eu1.luckypool.io:3370
 ```
 
-Prefer a GPU-difficulty endpoint (port `3360`) over the CPU pool (`3370`): the CPU
-pool's low difficulty produces frequent shares whose ~1 GB proof snapshot stalls the
-GPU between grids. Currently only LuckyPool's stratum protocol is supported; more planned.
+(The CPU pool's low difficulty produces frequent shares whose ~1 GB proof snapshot
+stalls a fast GPU between grids — hence the GPU-difficulty default for tensor-core
+cards.) Currently only LuckyPool's stratum protocol is supported; more planned.
 
 ### Solo Mining
 

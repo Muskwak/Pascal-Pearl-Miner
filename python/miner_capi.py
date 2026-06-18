@@ -35,6 +35,12 @@ VARIANT = 1  # pearl_pow_split S=128 4x4 MINB4
 # slot and scan the whole batch after a single sync. Tunable via P40_FOUND_BATCH.
 FOUND_BATCH = max(1, int(os.environ.get("P40_FOUND_BATCH", "64")))
 
+# Default pool by GPU class (overridden by --pool). Tensor-core cards (sm_80+) want a
+# GPU-difficulty pool; Pascal / DP4A cards (sm_61, e.g. the P40) mine fewer hashes so a
+# CPU-difficulty pool fits and avoids over-high share targets.
+POOL_GPU = "pearl-eu2.luckypool.io:3360"
+POOL_CPU = "pearl-cpu-eu1.luckypool.io:3370"
+
 
 class Bufs:
     """Device buffers reused across jobs (allocated once for the mandated dims)."""
@@ -246,6 +252,33 @@ def _list_gpu_indices():
         return []
 
 
+def _gpu_compute_cap():
+    """Compute-capability (float, e.g. 6.1 or 8.9) of this process's visible GPU via
+    nvidia-smi. Honors CUDA_VISIBLE_DEVICES so a supervised per-card child reads its
+    own pinned GPU. Returns None if it can't be determined."""
+    idx = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    cmd = ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"]
+    if idx:
+        cmd += ["-i", idx]
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        caps = [float(x) for x in out.splitlines() if x.strip()]
+        return caps[0] if caps else None
+    except Exception:
+        return None
+
+
+def _resolve_pool(args, log):
+    """If --pool wasn't given, pick the default by GPU class: Pascal / DP4A (sm < 8.0)
+    -> CPU-difficulty pool; tensor-core (sm_80+) -> GPU-difficulty pool. Per-process, so
+    a mixed P40 + Ada rig picks the right pool for each card."""
+    if args.pool:
+        return
+    cap = _gpu_compute_cap()
+    args.pool = POOL_CPU if (cap is not None and cap < 8.0) else POOL_GPU
+    log(f"auto-selected pool {args.pool} (GPU compute_cap {cap})")
+
+
 def run_supervisor(devices, args, log):
     """Spawn one single-GPU child process per device (pinned via CUDA_VISIBLE_DEVICES),
     prefix its output with [gpuN], and print a combined-hashrate summary. This is how
@@ -280,9 +313,10 @@ def run_supervisor(devices, args, log):
             "--single",
             "--wallet", args.wallet,
             "--worker", f"{args.worker}-gpu{d}",
-            "--pool", args.pool,
             "--region", str(args.region),
         ]
+        if args.pool:                       # else the child auto-picks by its GPU class
+            cmd += ["--pool", args.pool]
         if args.verify:
             cmd.append("--verify")
         p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
@@ -317,7 +351,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wallet", default=None)  # required for pool mining; unused in --solo
     ap.add_argument("--worker", default="p40")
-    ap.add_argument("--pool", default="pearl-eu2.luckypool.io:3360")  # GPU-difficulty pool
+    ap.add_argument("--pool", default=None,  # auto: Pascal -> CPU pool, sm_80+ -> GPU pool
+                    help="Stratum host:port. Default: auto by GPU class.")
     ap.add_argument("--region", type=int, default=4096)
     ap.add_argument("--max-regions", type=int, default=0)
     ap.add_argument("--max-jobs", type=int, default=0)
@@ -359,14 +394,14 @@ def main():
         if not devs:
             log("no GPUs selected via --devices")
             return
-        log(f"GPUs {devs} | one worker per card | pool {args.pool}")
+        log(f"GPUs {devs} | one worker per card | pool {args.pool or 'auto (per-GPU)'}")
         run_supervisor(devs, args, log)
         return
 
     # No flag: auto-detect. Multiple GPUs -> one worker each; single GPU -> run here.
     devs = _list_gpu_indices()
     if len(devs) > 1:
-        log(f"multi-GPU: {len(devs)} GPUs {devs} | one worker per card | pool {args.pool}")
+        log(f"multi-GPU: {len(devs)} GPUs {devs} | one worker per card | pool {args.pool or 'auto (per-GPU)'}")
         run_supervisor(devs, args, log)
         return
     if devs:
@@ -377,6 +412,7 @@ def main():
 def run_single_gpu(args, log):
     """Mine on this process's one visible GPU (device 0, or the card pinned by the
     supervisor via CUDA_VISIBLE_DEVICES)."""
+    _resolve_pool(args, log)
     host, port = args.pool.rsplit(":", 1)
     log(f"p40 miner (torch-free) | pool {args.pool} | region {args.region}")
     cfg = real_config()
@@ -457,6 +493,7 @@ def run_solo(args, log):
         log(f"dev fee: {sched.fee * 100:.1f}% of mining time -- during a dev round the "
             f"GPU mines to the dev's pool wallet instead of your node (transparent; "
             f"logged on every switch). Thank you!")
+    _resolve_pool(args, log)  # dev-round pool by GPU class when --pool not given
     dh, dp = args.pool.rsplit(":", 1)
     try:
         while True:
