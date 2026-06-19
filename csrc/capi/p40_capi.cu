@@ -203,15 +203,20 @@ P40_API int p40_pearl_pow_split(const void* A, const void* Bt, int m, int n,
                                  int k, int R, const void* key, const void* target,
                                  void* transcript, void* digests, void* found,
                                  void* coord, int variant) {
-  cudaDeviceProp prop;
-  int dev = 0;
-  cudaGetDevice(&dev);
-  cudaGetDeviceProperties(&prop, dev);
+  // Arch never changes for the life of the process; querying cudaGetDeviceProperties
+  // every region (1024x/grid) put a WDDM driver round-trip on the host launch path
+  // that must stay ahead of the ~2.2 ms GPU region. Cache it once (mirrors p40_noise_gemm).
+  static int s_major = -1;
+  if (s_major < 0) {
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) s_major = prop.major;
+    else s_major = 0;
+  }
 
   const int num_tiles = (m / 16) * (n / 16);
   uint32_t* tb = (uint32_t*)transcript;
 
-  if (prop.major >= 8) {
+  if (s_major >= 8) {
     // Ampere+ tensor-core path
     cudaError_t err = launch_pearl_ampere(
         (const int8_t*)A, (const int8_t*)Bt, m, n, k, R, tb, 0);
