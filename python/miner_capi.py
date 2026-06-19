@@ -215,14 +215,14 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                         sched.note(time.time() - t_acct)
                         return ("NEWJOB", newer)
                     if time.time() - last_print >= 5:
-                        ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
+                        ths = searched * tiles_per_region * 1048576.0 / max(time.time() - search_t0, 1e-9) / 1e12
                         log(f"  grid {grid}: {searched} regions ({ths:.2f} TH/s, {hits} hits)")
                         last_print = time.time()
             if stop:
                 break
         flush_batch()   # drain any partial last batch
 
-        ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
+        ths = searched * tiles_per_region * 1048576.0 / max(time.time() - search_t0, 1e-9) / 1e12
         log(f"  grid {grid} done: {hits} hits over {searched} regions ({ths:.2f} TH/s)")
 
         # charge elapsed wall time to the dev fee and switch wallets if it's time
@@ -653,7 +653,7 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
                         if len(batch) >= FOUND_BATCH:
                             res = flush_solo()
                             if time.time() - last_print >= 5:
-                                ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
+                                ths = searched * tiles_per_region * 1048576.0 / max(time.time() - search_t0, 1e-9) / 1e12
                                 log(f"  solo grid {grid}: {searched} regions ({ths:.2f} TH/s)")
                                 last_print = time.time()
                             if res is not None:
@@ -677,7 +677,7 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
                         submit_block(*res)
                         hit = True
                 if not hit:
-                    ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
+                    ths = searched * tiles_per_region * 1048576.0 / max(time.time() - search_t0, 1e-9) / 1e12
                     log(f"  solo grid {grid} swept ({ths:.2f} TH/s); no candidate")
                 now = time.time()
                 sched.note(now - t_acct)
